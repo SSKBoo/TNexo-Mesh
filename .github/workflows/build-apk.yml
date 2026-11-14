@@ -18,8 +18,12 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Configurar Android SDK y NDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools cmdline-tools;latest'
+    
+  
 
       - name: Instalar NDK 26 y cargo-ndk
         run: |
