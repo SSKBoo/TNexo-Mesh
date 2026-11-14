@@ -1,0 +1,39 @@
+name: Compilar NexoMesh Desktop (Windows, Linux, macOS)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: nexomesh-cli-linux-x86_64
+            bin: target/release/nexomesh-cli
+          - os: windows-latest
+            artifact: nexomesh-cli-windows-x86_64
+            bin: target/release/nexomesh-cli.exe
+          - os: macos-latest
+            artifact: nexomesh-cli-macos-arm64
+            bin: target/release/nexomesh-cli
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Compilar cliente Rust multiplataforma
+        working-directory: desktop-cli
+        run: cargo build --release
+
+      - name: Subir binario compilado
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: desktop-cli/${{ matrix.bin }}
