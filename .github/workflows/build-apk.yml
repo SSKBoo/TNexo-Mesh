@@ -32,7 +32,8 @@ jobs:
           targets: aarch64-linux-android
 
       - name: Instalar cargo-ndk
-        uses: taiki-e/install-action@cargo-ndk
+        run: cargo install cargo-ndk
+  
 
       - name: Compilar núcleo Rust JNI (arm64-v8a)
         working-directory: rust-core
