@@ -2930,10 +2930,7 @@ class MainActivity : AppCompatActivity() {
         return scroll
     }
 
-    private fun normalizeSearchText(value: String): String {
-        val normalized = Normalizer.normalize(value.trim().lowercase(Locale.US), Normalizer.Form.NFD)
-        return Regex("\\p{InCombiningDiacriticalMarks}+").replace(normalized, "")
-    }
+    private fun normalizeSearchText(value: String): String = FormattingHelper.normalize(value)
 
     private fun renderConnectPeerSearchResults() {
         if (!::connectPeerResultsContainer.isInitialized) return
@@ -3086,10 +3083,20 @@ class MainActivity : AppCompatActivity() {
         subTabScanBtn.setTextColor(Color.parseColor(if (!shareActive) "#F8FAFC" else "#94A3B8"))
     }
 
-    private fun refreshAllUi() {
-        val prefs = getSharedPreferences("nexomesh_prefs", MODE_PRIVATE)
-        val isLost = backoffAttempt > 0
+    /** Estilo compartido de los pills de transporte (Extraido de refreshAllUi). */
+    private fun styleTransportBtn(btn: Button, selected: Boolean, isAutoStyle: Boolean = false) {
+        if (selected) {
+            val activeBorder = if (isAutoStyle) themeAccent() else "#38BDF8"
+            btn.background = makeCardDrawable(if (isAutoStyle) "#064E3B" else "#0C4A6E", activeBorder, 12, 1)
+            btn.setTextColor(Color.parseColor(if (isAutoStyle) "#34D399" else "#7DD3FC"))
+        } else {
+            btn.background = makeCardDrawable(themeInset(), "#334155", 12, 1)
+            btn.setTextColor(Color.parseColor("#CBD5E1"))
+        }
+    }
 
+    /** Header / perfil */
+    private fun refreshHeaderUi(prefs: android.content.SharedPreferences, isLost: Boolean) {
         // Header Avatar & Name
         val profName = prefs.getString("user_name", Build.MODEL)?.ifBlank { Build.MODEL } ?: Build.MODEL
         headerProfileName.text = profName.take(12)
@@ -3113,6 +3120,10 @@ class MainActivity : AppCompatActivity() {
             headerAvatarBadge.text = savedPreset
         }
 
+    }
+
+    /** Header badge */
+    private fun refreshBadgeUi(prefs: android.content.SharedPreferences, isLost: Boolean) {
         // Header badge
         if (isLost) {
             headerBadge.text = "Sin Red"
@@ -3128,6 +3139,10 @@ class MainActivity : AppCompatActivity() {
             headerBadge.background = makeCardDrawable("#1E293B", "#334155", 99, 1)
         }
 
+    }
+
+    /** Tunnel status */
+    private fun refreshTunnelStatusUi(prefs: android.content.SharedPreferences, isLost: Boolean) {
         // Tunnel main status & power circle
         tunnelPolicyLabel.text = detectDevicePolicy()
         if (isLost) {
@@ -3161,6 +3176,10 @@ class MainActivity : AppCompatActivity() {
         tunnelGuardianMiniText.text = "🛡️ Guardián: ${if (shieldEnabled) "ENCENDIDO" else "APAGADO"} · Búnker ${if (bunkerMode) "ON" else "OFF"} · Bloqueados $blockedPacketsCount"
         tunnelGuardianMiniText.setTextColor(Color.parseColor(if (shieldEnabled) "#34D399" else "#FBBF24"))
 
+    }
+
+    /** Transport pills */
+    private fun refreshTransportUi(prefs: android.content.SharedPreferences, isLost: Boolean) {
         // Transport pills in Tunnel & Settings
         val medName = when (activeMedium) {
             "ethernet" -> "Cable Ethernet"
@@ -3175,16 +3194,6 @@ class MainActivity : AppCompatActivity() {
         }
         footerStatsText.text = "IP $myVirtualIp/24 · MTU $activeMtu · ${activeKeepalive}s"
 
-        fun styleTransportBtn(btn: Button, selected: Boolean, isAutoStyle: Boolean = false) {
-            if (selected) {
-                val activeBorder = if (isAutoStyle) themeAccent() else "#38BDF8"
-                btn.background = makeCardDrawable(if (isAutoStyle) "#064E3B" else "#0C4A6E", activeBorder, 12, 1)
-                btn.setTextColor(Color.parseColor(if (isAutoStyle) "#34D399" else "#7DD3FC"))
-            } else {
-                btn.background = makeCardDrawable(themeInset(), "#334155", 12, 1)
-                btn.setTextColor(Color.parseColor("#CBD5E1"))
-            }
-        }
         styleTransportBtn(btnAutoMode, autoTransportMode, true)
         styleTransportBtn(btnCellularMode, !autoTransportMode && activeMedium == "cellular")
         styleTransportBtn(btnWifiMode, !autoTransportMode && activeMedium == "wifi")
@@ -3203,6 +3212,10 @@ class MainActivity : AppCompatActivity() {
         styleTransportBtn(settingsKa15Btn, activeKeepalive == 15)
         styleTransportBtn(settingsKa25Btn, activeKeepalive == 25)
 
+    }
+
+    /** Recomendacion */
+    private fun refreshRecommendationUi(prefs: android.content.SharedPreferences, isLost: Boolean) {
         // Recommendation details in Settings
         when (activeMedium) {
             "ethernet" -> {
@@ -3225,6 +3238,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+    }
+
+    /** Keep-Alive PASS */
+    private fun refreshKeepAliveUi(prefs: android.content.SharedPreferences, isLost: Boolean) {
         // Keep-Alive PASS Status: verificaciones reales del sistema Android (sin auto-PASS)
         val batteryPass = isBatteryExempt()
         val lockPass = prefs.getBoolean("keepalive_lock_pass", false)
@@ -3265,6 +3282,10 @@ class MainActivity : AppCompatActivity() {
         guideInlineResultText.setTextColor(Color.parseColor(if (passedCount == 4) "#34D399" else "#CBD5E1"))
         renderGuideSteps(batteryPass, lockPass, vpnAlwaysOnPass, bgDataPass, bgAllowedReal, autoRevokeReal)
 
+    }
+
+    /** Theme y Guardian */
+    private fun refreshThemeGuardianUi(prefs: android.content.SharedPreferences, isLost: Boolean) {
         // Theme & Guardián Settings UI
         fun styleThemeBtn(btn: Button, selected: Boolean, accentHex: String) {
             if (selected) {
@@ -3332,6 +3353,10 @@ class MainActivity : AppCompatActivity() {
             defenseQuarantineContainer.addView(qBtn)
         }
 
+    }
+
+    /** Peers */
+    private fun refreshPeersUi(prefs: android.content.SharedPreferences, isLost: Boolean) {
         // Peers List
         peersHeaderTitle.text = "Amigos en tu Red (${connectedPeers.size})"
         peersListContainer.removeAllViews()
@@ -3388,6 +3413,10 @@ class MainActivity : AppCompatActivity() {
         }
         renderConnectPeerSearchResults()
 
+    }
+
+    /** Archivos */
+    private fun refreshFilesUi(prefs: android.content.SharedPreferences, isLost: Boolean) {
         // File Transfers UI (Dedicated Archivos Tab — Send/Receive subtabs + Multi-File/Folder Batch)
         fileSpeedModeBtn.text = if (fileMaxSpeedMode) {
             "Velocidad: Máxima Red Permitida (Turbo)"
@@ -3674,6 +3703,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+    }
+
+    /** Telemetria */
+    private fun refreshTelemetryUi(prefs: android.content.SharedPreferences, isLost: Boolean) {
         // Telemetry Graph & 4 Stat Boxes
         telemetryGraphView.setSeries(rttHistory, rxHistory, txHistory)
         val latestRtt = rttHistory.lastOrNull()?.toInt() ?: 0
@@ -3735,6 +3768,10 @@ class MainActivity : AppCompatActivity() {
         meshTopologyCanvasView.setMeshData(myVirtualIp, vpnRunning && !isLost, connectedPeers.toList())
         meshTopologySummaryText.text = "${connectedPeers.size + 1} nodos · ${activeBarItems.size} enlaces activos · Promedio $meshAvgBar ms"
 
+    }
+
+    /** Actividad y logs */
+    private fun refreshLogsUi(prefs: android.content.SharedPreferences, isLost: Boolean) {
         // Activity & Logs
         activityStunTitle.text = "Sonda STUN en Vivo ($activeStunServer)"
         activityStunEndpoint.text = "Endpoint: $lastStunMapped · Noise IKpsk2"
@@ -3782,6 +3819,23 @@ class MainActivity : AppCompatActivity() {
             row.addView(msg)
             logsContainer.addView(row)
         }
+    }
+
+
+    private fun refreshAllUi() {
+        val prefs = getSharedPreferences("nexomesh_prefs", MODE_PRIVATE)
+        val isLost = backoffAttempt > 0
+        refreshHeaderUi(prefs, isLost)
+        refreshBadgeUi(prefs, isLost)
+        refreshTunnelStatusUi(prefs, isLost)
+        refreshTransportUi(prefs, isLost)
+        refreshRecommendationUi(prefs, isLost)
+        refreshKeepAliveUi(prefs, isLost)
+        refreshThemeGuardianUi(prefs, isLost)
+        refreshPeersUi(prefs, isLost)
+        refreshFilesUi(prefs, isLost)
+        refreshTelemetryUi(prefs, isLost)
+        refreshLogsUi(prefs, isLost)
     }
 
     private fun renderGuideSteps(
@@ -4326,26 +4380,9 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun formatBytes(bytes: Long): String {
-        if (bytes < 1024L) return "$bytes B"
-        val kb = bytes / 1024.0
-        if (kb < 1024.0) return String.format(Locale.US, "%.1f KB", kb)
-        return String.format(Locale.US, "%.1f MB", kb / 1024.0)
-    }
+    private fun formatBytes(bytes: Long): String = FormattingHelper.formatBytes(bytes)
 
-    private fun getFileNameAndSize(uri: Uri): Pair<String, Long> {
-        var name = "archivo-${System.currentTimeMillis()}"
-        var size = 0L
-        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
-            if (cursor.moveToFirst()) {
-                if (nameIdx >= 0) name = cursor.getString(nameIdx) ?: name
-                if (sizeIdx >= 0) size = cursor.getLong(sizeIdx)
-            }
-        }
-        return name to size
-    }
+    private fun getFileNameAndSize(uri: Uri): Pair<String, Long> = FormattingHelper.fileNameAndSize(contentResolver, uri)
 
     private fun addPickedFilesToStage(uris: List<Uri>) {
         var added = 0
@@ -4952,59 +4989,11 @@ class MainActivity : AppCompatActivity() {
         mainHandler.postDelayed(loop, 500L)
     }
 
-    private fun getOrCreateTotpSecret(): String {
-        val prefs = getSharedPreferences("nexomesh_prefs", MODE_PRIVATE)
-        val existing = prefs.getString("totp_secret", null)
-        if (!existing.isNullOrBlank()) return existing
-        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-        val rand = SecureRandom()
-        val secret = (1..32).map { alphabet[rand.nextInt(alphabet.length)] }.joinToString("")
-        prefs.edit().putString("totp_secret", secret).apply()
-        return secret
-    }
+    private fun getOrCreateTotpSecret(): String = TotpHelper.getOrCreateSecret(this)
 
-    private fun decodeBase32(secret: String): ByteArray {
-        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-        var bits = 0
-        var value = 0
-        val out = mutableListOf<Byte>()
-        for (ch in secret.uppercase().replace("=", "")) {
-            val idx = alphabet.indexOf(ch)
-            if (idx < 0) continue
-            value = (value shl 5) or idx
-            bits += 5
-            if (bits >= 8) {
-                out.add(((value ushr (bits - 8)) and 0xFF).toByte())
-                bits -= 8
-            }
-        }
-        return out.toByteArray()
-    }
+    private fun decodeBase32(secret: String): ByteArray = TotpHelper.decodeBase32(secret)
 
-    private fun verifyGoogleTotp(secret: String, code: String): Boolean {
-        val clean = code.trim()
-        if (clean.length != 6 || clean.any { !it.isDigit() }) return false
-        return try {
-            val keyBytes = decodeBase32(secret)
-            val nowStep = System.currentTimeMillis() / 1000L / 30L
-            for (delta in -1L..1L) {
-                val data = ByteBuffer.allocate(8).putLong(nowStep + delta).array()
-                val mac = Mac.getInstance("HmacSHA1")
-                mac.init(SecretKeySpec(keyBytes, "HmacSHA1"))
-                val hash = mac.doFinal(data)
-                val offset = hash.last().toInt() and 0x0F
-                val binary = ((hash[offset].toInt() and 0x7F) shl 24) or
-                    ((hash[offset + 1].toInt() and 0xFF) shl 16) or
-                    ((hash[offset + 2].toInt() and 0xFF) shl 8) or
-                    (hash[offset + 3].toInt() and 0xFF)
-                val otp = (binary % 1_000_000).toString().padStart(6, '0')
-                if (otp == clean) return true
-            }
-            false
-        } catch (_: Exception) {
-            false
-        }
-    }
+    private fun verifyGoogleTotp(secret: String, code: String): Boolean = TotpHelper.verify(secret, code)
 
     private fun savePickedAvatarMedia(uri: Uri) {
         val mime = contentResolver.getType(uri) ?: "image/*"
@@ -5930,36 +5919,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun exportLogsToCsv() {
-        val csvFile = File(cacheDir, "nexomesh-logs.csv")
-        val header = "timestamp,severity,subsystem,peer_ip,message\n"
-        val body = logsList.joinToString("\n") { item ->
-            val escaped = item.message.replace("\"", "\"\"")
-            "${item.timestamp},${item.severity},${item.subsystem},${item.peerIp},\"$escaped\""
-        }
-        csvFile.writeText(header + body)
-        val contentUri = FileProvider.getUriForFile(this, "$packageName.fileprovider", csvFile)
-        val sendIntent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/csv"
-            putExtra(Intent.EXTRA_STREAM, contentUri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        startActivity(Intent.createChooser(sendIntent, "Exportar historial de logs CSV"))
+        val exporter = LogExporter(this)
+        startActivity(exporter.exportCsv(logsList.map {
+            LogExporter.Row(it.timestamp, it.severity, it.subsystem, it.peerIp, it.message)
+        }))
     }
 
     private fun exportLogsToJson() {
-        val jsonFile = File(cacheDir, "nexomesh-audit.json")
-        val rows = logsList.joinToString(",\n") { item ->
-            val escaped = item.message.replace("\"", "\\\"")
-            "  {\"timestamp\":\"${item.timestamp}\",\"severity\":\"${item.severity}\",\"subsystem\":\"${item.subsystem}\",\"peer_ip\":\"${item.peerIp}\",\"message\":\"$escaped\"}"
-        }
-        jsonFile.writeText("{\n\"logs\":[\n$rows\n]\n}")
-        val contentUri = FileProvider.getUriForFile(this, "$packageName.fileprovider", jsonFile)
-        val sendIntent = Intent(Intent.ACTION_SEND).apply {
-            type = "application/json"
-            putExtra(Intent.EXTRA_STREAM, contentUri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        startActivity(Intent.createChooser(sendIntent, "Exportar auditoría JSON"))
+        val exporter = LogExporter(this)
+        startActivity(exporter.exportJson(logsList.map {
+            LogExporter.Row(it.timestamp, it.severity, it.subsystem, it.peerIp, it.message)
+        }))
     }
 
     private fun requestAndStartVpn() {
