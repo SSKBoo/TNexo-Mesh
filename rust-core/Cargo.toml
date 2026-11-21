@@ -4,9 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 jni = "0.21"
 snow = "0.10"
-x25519-dalek = "2.0"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+blake2 = "0.10"
+anyhow = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[[bin]]
+name = "nexomesh-cli"
+path = "src/bin/nexomesh-cli.rs"

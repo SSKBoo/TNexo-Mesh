@@ -481,6 +481,40 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Registra el descubrimiento bidireccional de pares. Al recibir NM_HELLO/NM_ACK
+     * de otro par, se agrega o actualiza automǭticamente en la lista.
+     */
+    private fun registerPeerDiscoveryCallback() {
+        MeshVpnService.registerDiscoveredPeerCallback { vip, name, remoteAddr ->
+            runOnUiThread {
+                val discovered = connectedPeers.firstOrNull { it.virtualIp == vip }
+                if (discovered == null) {
+                    connectedPeers.add(
+                        PeerItem(
+                            id = "peer-${System.currentTimeMillis()}",
+                            name = name,
+                            virtualIp = vip,
+                            platform = "P2P Mesh",
+                            endpoint = remoteAddr,
+                            lanEndpoint = remoteAddr,
+                            online = true,
+                            rttMs = 1
+                        )
+                    )
+                } else {
+                    discovered.endpoint = remoteAddr
+                    discovered.lanEndpoint = remoteAddr
+                    discovered.online = true
+                    discovered.rttMs = 1
+                }
+                syncPeersToVpnService()
+                appendLog("INFO", "Noise", vip, "Par P2P descubierto y enlazado: '$name' ($remoteAddr)")
+                refreshAllUi()
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -489,6 +523,7 @@ class MainActivity : AppCompatActivity() {
         val bootPrefs = getSharedPreferences("nexomesh_prefs", MODE_PRIVATE)
         myVirtualIp = bootPrefs.getString("my_virtual_ip", "10.0.0.1") ?: "10.0.0.1"
         MeshVpnService.updateLocalVirtualIp(myVirtualIp)
+        registerPeerDiscoveryCallback()
         activeTheme = bootPrefs.getString("app_theme", "dark") ?: "dark"
         shieldEnabled = bootPrefs.getBoolean("guardian_enabled", true)
         policyAutoQuarantine = bootPrefs.getBoolean("policy_quarantine", true)
@@ -682,6 +717,22 @@ class MainActivity : AppCompatActivity() {
         startTelemetryAndTransferLoops()
         runStunProbeAsync(silent = true)
         checkFirstInstallScan()
+
+        // Invitaciǫn sin QR: abrir directamente nexomesh://join?...
+        handleInviteIntent(intent)
+    }
+
+    private fun handleInviteIntent(incoming: Intent?) {
+        val data = incoming?.data ?: return
+        if (data.scheme == "nexomesh" && data.host == "join") {
+            handleScannedInviteUri(data.toString())
+        }
+    }
+
+    override fun onNewIntent(incoming: Intent) {
+        super.onNewIntent(incoming)
+        setIntent(incoming)
+        handleInviteIntent(incoming)
     }
 
     override fun onResume() {
@@ -848,10 +899,16 @@ class MainActivity : AppCompatActivity() {
         return dialog
     }
 
-    private fun getLocalLanIpAddress(): String {
+    /**
+     * Devuelve todas las IPv4 LAN candidatas (excluyendo la subnet virtual 10.0.0.x).
+     * Prioriza wlan/ap/rndis sobre eth: en emuladores eth0 es compartida (10.0.2.15)
+     * mientras que wlan0 es única por instancia y alcanzable entre emuladores.
+     */
+    private fun getLocalLanIpCandidates(): List<String> {
         return try {
             val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
-            var fallback: String? = null
+            val preferred = mutableListOf<String>()
+            val others = mutableListOf<String>()
             for (iface in interfaces) {
                 if (!iface.isUp || iface.isLoopback) continue
                 val n = iface.name.lowercase()
@@ -860,18 +917,21 @@ class MainActivity : AppCompatActivity() {
                     if (!addr.isLoopbackAddress && addr is Inet4Address) {
                         val ip = addr.hostAddress ?: continue
                         if (ip.startsWith("10.0.0.")) continue
-                        if (n.contains("wlan") || n.contains("ap") || n.contains("eth") || n.contains("rndis")) {
-                            return ip
+                        if (n.contains("wlan") || n.contains("ap") || n.contains("rndis")) {
+                            preferred.add(ip)
+                        } else if (n.contains("eth")) {
+                            others.add(ip)
                         }
-                        if (fallback == null) fallback = ip
                     }
                 }
             }
-            fallback ?: ""
+            (preferred + others).distinct()
         } catch (_: Exception) {
-            ""
+            emptyList()
         }
     }
+
+    private fun getLocalLanIpAddress(): String = getLocalLanIpCandidates().firstOrNull() ?: ""
 
     private fun syncPeersToVpnService() {
         val list = connectedPeers.filter { !it.quarantined && it.online }.map {
@@ -2708,7 +2768,7 @@ class MainActivity : AppCompatActivity() {
         policyAutoBunkerSwitch = makePolicyCheck("Activar Búnker automático en alerta crítica", "policy_autobunker", policyAutoBunkerOnCrit) {
             policyAutoBunkerOnCrit = it
         }
-        policyStrictDnsKill = makePolicyCheck("Bloqueo estricto DNS fuera del túnel VPN", "policy_strictdns", policyStrictDnsKill) {
+        policyStrictDnsSwitch = makePolicyCheck("Bloqueo estricto DNS fuera del túnel VPN", "policy_strictdns", policyStrictDnsKill) {
             policyStrictDnsKill = it
         }
 
@@ -2754,7 +2814,7 @@ class MainActivity : AppCompatActivity() {
         defenseCard.addView(policyRotateSwitch)
         defenseCard.addView(policyRateLimitSwitch)
         defenseCard.addView(policyAutoBunkerSwitch)
-        defenseCard.addView(policyStrictDnsKill)
+        defenseCard.addView(policyStrictDnsSwitch)
         defenseCard.addView(attackTitle)
         defenseCard.addView(atkRow1)
         defenseCard.addView(atkMitmBtn)
@@ -3144,7 +3204,7 @@ class MainActivity : AppCompatActivity() {
         policyRotateSwitch.isChecked = policyAutoRotateKeys
         policyRateLimitSwitch.isChecked = policyUdpRateLimit
         policyAutoBunkerSwitch.isChecked = policyAutoBunkerOnCrit
-        policyStrictDnsKill.isChecked = policyStrictDnsKill
+        policyStrictDnsSwitch.isChecked = policyStrictDnsKill
 
         defenseQuarantineContainer.removeAllViews()
         for (qp in quarantinedPeers) {
@@ -4058,9 +4118,13 @@ class MainActivity : AppCompatActivity() {
         val pubKey = getOrCreatePublicKey()
         val nextIp = allocateNextPeerIp()
         val lanIp = getLocalLanIpAddress()
+        val lanCandidates = getLocalLanIpCandidates()
         val lanEp = if (lanIp.isNotBlank()) "$lanIp:51820" else ""
+        val lansParam = lanCandidates.joinToString(",") { "$it:51820" }
         val epParam = if (lastStunMapped.contains(":")) lastStunMapped else lanEp.ifBlank { "auto:51820" }
-        val base = "nexomesh://join?pk=${Uri.encode(pubKey)}&ep=${Uri.encode(epParam)}&lan=${Uri.encode(lanEp)}&hostIp=$myVirtualIp&ip=$nextIp&noise=IKpsk2&name=${Uri.encode(Build.MODEL)}"
+        val base = "nexomesh://join?pk=${Uri.encode(pubKey)}&ep=${Uri.encode(epParam)}" +
+            "&lan=${Uri.encode(lanEp)}&lans=${Uri.encode(lansParam)}" +
+            "&hostIp=$myVirtualIp&ip=$nextIp&noise=IKpsk2&name=${Uri.encode(Build.MODEL)}"
         return if (inviteRequire2fa) {
             "$base&auth2fa=1&pin=$currentInvitePin"
         } else {
@@ -5643,14 +5707,64 @@ class MainActivity : AppCompatActivity() {
         val peerHostIp = uri.getQueryParameter("hostIp") ?: "10.0.0.1"
         val endpoint = uri.getQueryParameter("ep") ?: "STUN directo"
         val lanEp = uri.getQueryParameter("lan") ?: ""
+        val peerPublicKey = uri.getQueryParameter("pk") ?: ""
+        val lansRaw = uri.getQueryParameter("lans") ?: ""
         val require2fa = uri.getQueryParameter("auth2fa") == "1"
         val expectedPin = uri.getQueryParameter("pin") ?: ""
+
+        // Todos los endpoints LAN candidatos del invitador, incluido el principal.
+        val allLans = (lansRaw.split(",") + lanEp)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+        val helloTargets = allLans.joinToString(",")
+
+        // Descubrimiento bidireccional: al recibir NM_ACK del otro par se agrega
+        // automǭticamente a la lista de pares.
+        MeshVpnService.registerDiscoveredPeerCallback { vip, name, remoteAddr ->
+            runOnUiThread {
+                val discovered = connectedPeers.firstOrNull { it.virtualIp == vip }
+                if (discovered == null) {
+                    connectedPeers.add(
+                        PeerItem(
+                            id = "peer-${System.currentTimeMillis()}",
+                            name = name,
+                            virtualIp = vip,
+                            platform = "P2P Mesh",
+                            endpoint = remoteAddr,
+                            lanEndpoint = remoteAddr,
+                            online = true,
+                            rttMs = 1
+                        )
+                    )
+                } else {
+                    discovered.endpoint = remoteAddr
+                    discovered.lanEndpoint = remoteAddr
+                    discovered.online = true
+                    discovered.rttMs = 1
+                }
+                syncPeersToVpnService()
+                appendLog("INFO", "Noise", vip, "Par P2P descubierto y enlazado: '$name' ($remoteAddr)")
+                refreshAllUi()
+            }
+        }
+
+        fun sendHello() {
+            Thread {
+                MeshVpnService.sendHelloBurstToPeer(helloTargets, endpoint, myVirtualIp, Build.MODEL)
+            }.start()
+        }
 
         fun finalizeJoin() {
             myVirtualIp = assignedLocalIp
             getSharedPreferences("nexomesh_prefs", MODE_PRIVATE).edit()
                 .putString("my_virtual_ip", myVirtualIp)
                 .apply()
+            if (peerPublicKey.isNotBlank()) {
+                getSharedPreferences("nexomesh_prefs", MODE_PRIVATE).edit()
+                    .putString("peer_pk_$peerHostIp", peerPublicKey)
+                    .apply()
+            }
             MeshVpnService.updateLocalVirtualIp(myVirtualIp)
 
             val existing = connectedPeers.firstOrNull { it.virtualIp == peerHostIp }
@@ -5662,26 +5776,34 @@ class MainActivity : AppCompatActivity() {
                         virtualIp = peerHostIp,
                         platform = "P2P Mesh",
                         endpoint = endpoint,
-                        lanEndpoint = lanEp,
-                        online = true
+                        lanEndpoint = helloTargets,
+                        online = true,
+                        rttMs = 1
                     )
                 )
             } else {
                 existing.endpoint = endpoint
-                if (lanEp.isNotBlank()) existing.lanEndpoint = lanEp
+                existing.lanEndpoint = helloTargets
                 existing.online = true
+                existing.rttMs = 1
             }
             pendingSendTargetIp = peerHostIp
             if (::fileTargetIpInput.isInitialized) {
                 fileTargetIpInput.setText(peerHostIp)
             }
             syncPeersToVpnService()
-            Thread {
-                MeshVpnService.sendHelloBurstToPeer(lanEp, endpoint, myVirtualIp, Build.MODEL)
-            }.start()
             appendLog("INFO", "Noise", peerHostIp, "Enlazado a '$peerName' ($peerHostIp) · Tu IP local asignada: $myVirtualIp (${lanEp.ifBlank { endpoint }})")
             if (vpnRunning) {
-                startMeshTunnel()
+                sendHello()
+                mainHandler.postDelayed({ sendHello() }, 1500L)
+            } else {
+                // El socket UDP solo existe con el tǧnel activo. Iniciar VPN y
+                // reintentar el saludo hasta que el socket estǩ disponible.
+                appendLog("INFO", "Noise", peerHostIp, "Iniciando tǧnel VPN para el enlace P2P con '$peerName'")
+                requestAndStartVpn()
+                for (delay in listOf(800L, 2000L, 4000L)) {
+                    mainHandler.postDelayed({ sendHello() }, delay)
+                }
             }
             switchTab(AppTab.TUNNEL)
             refreshAllUi()

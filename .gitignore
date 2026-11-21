@@ -1,0 +1,42 @@
+# Node / dependencias
+node_modules/
+npm-debug.log*
+.pnpm-store/
+
+# Build outputs
+dist/
+build/
+app/build/
+.gradle/
+.kotlin/
+test-results/
+playwright-report/
+blob-report/
+
+# Rust
+rust-core/target/
+target/
+*.so
+*.a
+*.pdb
+*.dll.exp
+*.dll.lib
+
+# IDE / SO
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Temporales
+*.log
+*.tmp
+screen*.png
+.env
+!backend/.env.example
+
+# Keystores (nunca subir secretos reales)
+*.jks
+*.keystore
+*.p12

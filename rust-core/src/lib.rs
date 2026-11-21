@@ -1,3 +1,14 @@
+﻿pub mod crypto;
+pub mod keys;
+pub mod noise;
+pub mod tunnel;
+pub mod routing;
+pub mod stun;
+pub mod turn;
+pub mod signaling;
+pub mod peer;
+pub mod mesh;
+
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::JNIEnv;
@@ -111,7 +122,7 @@ pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_discoverStunEndpoint(
                 match sock.recv_from(&mut buf) {
                     Ok((len, _)) if len >= 20 => {
                         if let Some(mapped) = parse_stun_mapped_endpoint(&buf[..len]) {
-                            format!("STUN OK · Endpoint {mapped} ({server})")
+                            format!("STUN OK Â· Endpoint {mapped} ({server})")
                         } else {
                             format!("STUN OK ({len} bytes desde {server})")
                         }
@@ -119,7 +130,7 @@ pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_discoverStunEndpoint(
                     _ => format!("Sin respuesta UDP de {server}"),
                 }
             } else {
-                format!("Fallo envío UDP a {server}")
+                format!("Fallo envÃ­o UDP a {server}")
             }
         }
         (None, _) => format!("No se pudo resolver {server}"),
@@ -168,3 +179,42 @@ pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_inspectPacket(
     }
     1
 }
+
+
+// ---------------------------------------------------------------------------
+// FFI C ABI (nexomesh_* symbols)
+// ---------------------------------------------------------------------------
+use std::ffi::{c_char, CString};
+
+static LAST_STATUS: std::sync::Mutex<Option<CString>> = std::sync::Mutex::new(None);
+
+fn status_json() -> String {
+    format!(
+        "{{\"tunnel_active\":{},\"bunker_mode\":{},\"blocked_packets\":{}}}",
+        TUNNEL_ACTIVE.load(Ordering::SeqCst),
+        BUNKER_MODE.load(Ordering::SeqCst),
+        BLOCKED_PACKETS.load(Ordering::SeqCst),
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn nexomesh_init() {}
+
+#[no_mangle]
+pub extern "C" fn nexomesh_connect(_pubkey: *const c_char, _endpoint: *const c_char) -> i32 { 0 }
+
+#[no_mangle]
+pub extern "C" fn nexomesh_disconnect() {}
+
+#[no_mangle]
+pub extern "C" fn nexomesh_status_json() -> *const c_char {
+    let mut guard = LAST_STATUS.lock().unwrap();
+    *guard = CString::new(status_json()).ok();
+    guard.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null())
+}
+
+#[no_mangle]
+pub extern "C" fn nexomesh_send_file(_peer: *const c_char, _path: *const c_char) -> i32 { 0 }
+
+#[no_mangle]
+pub extern "C" fn nexomesh_on_event(_cb: extern "C" fn(*const c_char)) {}

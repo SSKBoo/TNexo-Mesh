@@ -51,6 +51,9 @@ class MeshVpnService : VpnService() {
         var bunkerMode: Boolean = false
 
         @Volatile
+        var guardianEnabled: Boolean = false
+
+        @Volatile
         var blockedPacketsCount: Long = 0L
 
         val quarantinedIps = java.util.Collections.synchronizedSet(mutableSetOf<String>())
@@ -89,7 +92,9 @@ class MeshVpnService : VpnService() {
         fun sendHelloBurstToPeer(lanEndpoint: String, stunEndpoint: String, myIp: String, myName: String) {
             val sock = activeUdpSocket ?: return
             val helloBytes = "NM_HELLO|$myIp|$myName|$lanEndpoint".toByteArray(Charsets.UTF_8)
-            for (raw in listOf(lanEndpoint, stunEndpoint)) {
+            val targets = listOf(lanEndpoint, stunEndpoint)
+                .flatMap { raw -> raw.split(",").map { it.trim() } }
+            for (raw in targets) {
                 val parsed = parseHostPort(raw, MESH_UDP_PORT) ?: continue
                 try {
                     val addr = InetAddress.getByName(parsed.first)
@@ -372,18 +377,17 @@ class MeshVpnService : VpnService() {
         learnedSocketAddrs[dstVirtualIp]?.let { list.add(it) }
         val info = peerRoutes[dstVirtualIp]
         if (info != null) {
-            parseHostPort(info.lanEndpoint, MESH_UDP_PORT)?.let { (h, p) ->
-                try {
-                    val isa = InetSocketAddress(InetAddress.getByName(h), p)
-                    if (!list.contains(isa)) list.add(isa)
-                } catch (_: Exception) {
-                }
-            }
-            parseHostPort(info.stunEndpoint, MESH_UDP_PORT)?.let { (h, p) ->
-                try {
-                    val isa = InetSocketAddress(InetAddress.getByName(h), p)
-                    if (!list.contains(isa)) list.add(isa)
-                } catch (_: Exception) {
+            // Los endpoints pueden contener varias direcciones separadas por coma
+            // (invitaciones con multiples candidatos LAN). Probar todas.
+            val rawTargets = listOf(info.lanEndpoint, info.stunEndpoint)
+                .flatMap { raw -> raw.split(",").map { it.trim() } }
+            for (raw in rawTargets) {
+                parseHostPort(raw, MESH_UDP_PORT)?.let { (h, p) ->
+                    try {
+                        val isa = InetSocketAddress(InetAddress.getByName(h), p)
+                        if (!list.contains(isa)) list.add(isa)
+                    } catch (_: Exception) {
+                    }
                 }
             }
         }
