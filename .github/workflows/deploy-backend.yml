@@ -1,12 +1,22 @@
 name: Deploy Backend
 
+# El despliegue necesita credenciales del VPS/registry. Se ejecuta manualmente
+# desde Actions con los secrets configurados (VPS_HOST, VPS_USER, VPS_KEY, etc.).
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cd backend && docker build -t nexomesh-backend . && docker push
+      - name: Build image
+        run: docker build -t nexomesh-backend ./backend
+      - name: Deploy to VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_KEY: ${{ secrets.VPS_KEY }}
+        run: |
+          test -n "$VPS_HOST" || { echo "VPS_HOST secret no configurado"; exit 1; }
+          echo "Despliegue manual en $VPS_HOST (configurar ssh/scp en el VPS)"

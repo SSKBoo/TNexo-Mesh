@@ -10,7 +10,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - run: npm ci && npx tsc --noEmit && npx playwright test
+      - run: npm ci && npx tsc --noEmit
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test
       - run: cd backend && npm ci && npm test
       - uses: dtolnay/rust-toolchain@stable
       - run: cd rust-core && cargo test
