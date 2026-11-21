@@ -162,7 +162,7 @@ class MainActivity : AppCompatActivity() {
 
     private var fileReceiverActive = false
     private var fileServerSocket: ServerSocket? = null
-    private var pendingSendTargetIp = "10.0.0.2"
+    private var pendingSendTargetIp = ""
     private var receiveFolderUri: Uri? = null
     private var receiveFolderLabel = ""
     private var startReceiverAfterFolderPick = false
@@ -720,6 +720,8 @@ class MainActivity : AppCompatActivity() {
 
         // Invitaciǫn sin QR: abrir directamente nexomesh://join?...
         handleInviteIntent(intent)
+        // Configurar los callbacks del receptor :51821 aunque el usuario no abra Archivos.
+        startFileReceiverSocketLoop()
     }
 
     private fun handleInviteIntent(incoming: Intent?) {
@@ -904,6 +906,11 @@ class MainActivity : AppCompatActivity() {
      * Prioriza wlan/ap/rndis sobre eth: en emuladores eth0 es compartida (10.0.2.15)
      * mientras que wlan0 es única por instancia y alcanzable entre emuladores.
      */
+    /** Primer par enlazado distinto de esta IP; nunca la propia. */
+    private fun defaultSendTargetIp(): String {
+        return connectedPeers.firstOrNull { it.online && it.virtualIp != myVirtualIp }?.virtualIp ?: ""
+    }
+
     private fun getLocalLanIpCandidates(): List<String> {
         return try {
             val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
@@ -1441,14 +1448,14 @@ class MainActivity : AppCompatActivity() {
         val pickFilesBtn = makeStyledButton("+ Elegir Archivos (Varios)", "#059669", "#10B981", "#FFFFFF").apply {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(4) }
             setOnClickListener {
-                pendingSendTargetIp = fileTargetIpInput.text.toString().trim().ifEmpty { "10.0.0.2" }
+                pendingSendTargetIp = fileTargetIpInput.text.toString().trim().ifEmpty { defaultSendTargetIp() }
                 multiFilePickerLauncher.launch(arrayOf("*/*"))
             }
         }
         val pickFolderBtn = makeStyledButton("+ Agregar Carpeta", "#0C4A6E", "#38BDF8", "#BAE6FD").apply {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(4) }
             setOnClickListener {
-                pendingSendTargetIp = fileTargetIpInput.text.toString().trim().ifEmpty { "10.0.0.2" }
+                pendingSendTargetIp = fileTargetIpInput.text.toString().trim().ifEmpty { defaultSendTargetIp() }
                 folderPickerLauncher.launch(null)
             }
         }
@@ -1498,7 +1505,7 @@ class MainActivity : AppCompatActivity() {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = dp(8) }
             setOnClickListener {
-                pendingSendTargetIp = fileTargetIpInput.text.toString().trim().ifEmpty { "10.0.0.2" }
+                pendingSendTargetIp = fileTargetIpInput.text.toString().trim().ifEmpty { defaultSendTargetIp() }
                 sendStagedBatchP2P(pendingSendTargetIp)
             }
         }
@@ -4447,12 +4454,19 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 bos.flush()
-            }
-            mainHandler.post {
-                ftItem.status = "completed"
-                ftItem.progressPct = 100
-                appendLog("INFO", "WireGuard", targetIp, "Archivo '$fileName' (${formatBytes(sendSize)}) enviado vía $channelLabel ($usedHost:51821)")
-                refreshAllUi()
+                // Confirmación real: el emisor solo completa si el receptor validó los bytes.
+                sock.soTimeout = 15_000
+                val ack = readAsciiLine(DataInputStream(BufferedInputStream(sock.getInputStream())))
+                val parts = ack.split("|")
+                val ackOk = parts.size >= 4 && parts[0] == "NEXOMESH_ACK" && parts[1] == "OK" &&
+                    (parts[2].toLongOrNull() ?: -1L) == sendSize
+                if (!ackOk) throw java.io.IOException("ACK inválido del receptor: ${ack.take(60)}")
+                mainHandler.post {
+                    ftItem.status = "completed"
+                    ftItem.progressPct = 100
+                    appendLog("INFO", "WireGuard", targetIp, "Archivo '$fileName' (${formatBytes(sendSize)}) confirmado por el receptor sha256=${parts[3].take(12)}... vía $channelLabel ($usedHost:51821)")
+                    refreshAllUi()
+                }
             }
         } catch (e: Exception) {
             mainHandler.post {
@@ -4704,8 +4718,7 @@ class MainActivity : AppCompatActivity() {
     private fun toggleFileReceiverServer() {
         if (fileReceiverActive) {
             fileReceiverActive = false
-            try { fileServerSocket?.close() } catch (_: Exception) {}
-            fileServerSocket = null
+            FileTransferCore.stop()
             appendLog("WARNING", "WireGuard", myVirtualIp, "Receptor de archivos P2P (:51821) detenido")
             refreshAllUi()
             return
@@ -4736,100 +4749,40 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startFileReceiverSocketLoop() {
-        fileReceiverActive = true
-        appendLog("INFO", "WireGuard", myVirtualIp, "Receptor P2P escuchando en :51821 -> Carpeta: ${receiveFolderLabel.ifBlank { "Descargas/NexoMesh" }}")
-        refreshAllUi()
-
-        Thread {
-            try {
-                val server = ServerSocket().apply {
-                    reuseAddress = true
-                    bind(InetSocketAddress(51821))
-                }
-                fileServerSocket = server
-                val saveDir = File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "NexoMesh").apply { mkdirs() }
-                while (fileReceiverActive && !server.isClosed) {
-                    val client = server.accept()
-                    Thread {
-                        try {
-                            client.use { sock ->
-                                val dis = DataInputStream(BufferedInputStream(sock.getInputStream(), 65536))
-                                val magic = readAsciiLine(dis)
-                                val senderIp = sock.inetAddress?.hostAddress ?: "10.0.0.x"
-                                val buf = ByteArray(65536)
-                                if (magic == "NEXOMESH_FILE") {
-                                    val rawName = readAsciiLine(dis).ifBlank { "recibido-${System.currentTimeMillis()}" }
-                                    val safeName = File(rawName).name
-                                    val declaredSize = (readAsciiLine(dis).toLongOrNull() ?: 0L).coerceIn(0L, 512L * 1024L * 1024L)
-                                    val chosenTree = receiveFolderUri
-                                    val safOut = if (chosenTree != null) openSafOutputStream(chosenTree, safeName) else null
-                                    val outFile = File(saveDir, safeName)
-                                    val targetOut = safOut ?: FileOutputStream(outFile)
-                                    var received = 0L
-                                    BufferedOutputStream(targetOut, 65536).use { bos ->
-                                        while (received < declaredSize) {
-                                            val chunk = dis.read(buf, 0, minOf(buf.size.toLong(), declaredSize - received).toInt())
-                                            if (chunk <= 0) break
-                                            bos.write(buf, 0, chunk)
-                                            received += chunk
-                                        }
-                                        bos.flush()
-                                    }
-                                    mainHandler.post {
-                                        fileTransfersList.add(0, TransferItem("ft-${System.currentTimeMillis()}", safeName, received, "receive", senderIp, "completed", 100, 0, null, if (safOut != null) null else outFile))
-                                        appendLog("INFO", "WireGuard", senderIp, "Archivo '$safeName' (${formatBytes(received)}) recibido en ${receiveFolderLabel.ifBlank { "Descargas/NexoMesh" }}")
-                                        refreshAllUi()
-                                    }
-                                } else if (magic == "NEXOMESH_FOLDER") {
-                                    val rootName = File(readAsciiLine(dis).ifBlank { "Carpeta-${System.currentTimeMillis()}" }).name
-                                    val count = readAsciiLine(dis).toIntOrNull() ?: 0
-                                    var totalBytes = 0L
-                                    var firstFile: File? = null
-                                    val chosenTree = receiveFolderUri
-                                    for (i in 0 until count) {
-                                        val rawRel = readAsciiLine(dis).replace("\\", "/").trimStart('/')
-                                        val safeRel = rawRel.split('/').filter { it.isNotBlank() && it != ".." && it != "." }.joinToString("/").ifBlank { "$rootName/archivo-$i" }
-                                        val declaredSize = (readAsciiLine(dis).toLongOrNull() ?: 0L).coerceIn(0L, 512L * 1024L * 1024L)
-                                        val safOut = if (chosenTree != null) openSafOutputStream(chosenTree, safeRel) else null
-                                        val outFile = File(saveDir, safeRel)
-                                        if (safOut == null) {
-                                            outFile.parentFile?.mkdirs()
-                                            if (firstFile == null) firstFile = outFile
-                                        }
-                                        val targetOut = safOut ?: FileOutputStream(outFile)
-                                        var received = 0L
-                                        BufferedOutputStream(targetOut, 65536).use { bos ->
-                                            while (received < declaredSize) {
-                                                val chunk = dis.read(buf, 0, minOf(buf.size.toLong(), declaredSize - received).toInt())
-                                                if (chunk <= 0) break
-                                                bos.write(buf, 0, chunk)
-                                                received += chunk
-                                            }
-                                            bos.flush()
-                                        }
-                                        totalBytes += received
-                                    }
-                                    mainHandler.post {
-                                        fileTransfersList.add(0, TransferItem("ft-${System.currentTimeMillis()}", "$rootName/ ($count arch.)", totalBytes, "receive", senderIp, "completed", 100, 0, null, firstFile))
-                                        appendLog("INFO", "WireGuard", senderIp, "Carpeta íntegra '$rootName/' ($count archivos, ${formatBytes(totalBytes)}) recibida en ${receiveFolderLabel.ifBlank { "Descargas/NexoMesh" }}")
-                                        refreshAllUi()
-                                    }
-                                }
-                            }
-                        } catch (_: Exception) {
-                        }
-                    }.start()
-                }
-            } catch (e: Exception) {
-                if (fileReceiverActive) {
-                    mainHandler.post {
-                        fileReceiverActive = false
-                        appendLog("WARNING", "WireGuard", myVirtualIp, "Receptor :51821 cerrado (${e.message})")
-                        refreshAllUi()
-                    }
-                }
+        // El ServerSocket :51821 ahora lo posee MeshVpnService via FileTransferCore.
+        // La Activity solo configura los callbacks para reflejarlo en la UI.
+        FileTransferCore.openOutput = { rel -> receiveFolderUri?.let { openSafOutputStream(it, rel) } }
+        FileTransferCore.onReceived = { r ->
+            mainHandler.post {
+                fileTransfersList.add(0, TransferItem(
+                    id = "ft-${System.currentTimeMillis()}",
+                    fileName = r.name,
+                    sizeBytes = r.size,
+                    direction = "receive",
+                    peerIp = r.senderIp,
+                    status = "completed",
+                    progressPct = 100,
+                    frostLevel = 0,
+                    errorReason = null,
+                    localFile = r.localPath?.let { File(it) },
+                    sourceUri = null,
+                    isFolder = r.isFolder,
+                    channel = "TCP :51821"
+                ))
+                fileReceiverActive = true
+                appendLog("INFO", "WireGuard", r.senderIp, "Recibido '${r.name}' (${formatBytes(r.size)}) sha256=${r.sha256.take(12)}...")
+                refreshAllUi()
             }
-        }.start()
+        }
+        FileTransferCore.onStatus = { st ->
+            mainHandler.post {
+                fileReceiverActive = st == "listening"
+                refreshAllUi()
+            }
+        }
+        FileTransferCore.start(this)
+        fileReceiverActive = FileTransferCore.running
+        refreshAllUi()
     }
 
     private fun readAsciiLine(dis: DataInputStream): String {
@@ -4862,11 +4815,9 @@ class MainActivity : AppCompatActivity() {
                         ft.frostLevel = maxOf(0, ft.frostLevel - 25)
                         if (ft.frostLevel == 0) ft.status = "transferring"
                         dirty = true
-                    } else if (ft.status == "transferring") {
-                        ft.progressPct = min(100, ft.progressPct + if (fileMaxSpeedMode) 18 else 9)
-                        if (ft.progressPct >= 100) ft.status = "completed"
-                        dirty = true
                     }
+                    // NOTA: el progreso de transferencias SOLO lo actualiza el hilo real de
+                    // envío/recepción cuando se escriben bytes. Nunca un temporizador simulado.
                 }
                 if (waveTick % 4 == 0) {
                     val phase = waveTick * 0.25

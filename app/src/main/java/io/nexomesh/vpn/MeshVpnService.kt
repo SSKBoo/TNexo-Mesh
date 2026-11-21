@@ -202,6 +202,9 @@ class MeshVpnService : VpnService() {
         }
         if (tunFd != null) {
             startForwardLoops(localIp, keepalive)
+            // El receptor :51821 vive en el servicio, no en la Activity: arranca
+            // automaticamente con la VPN y sobrevive a recreaciones de pantalla.
+            FileTransferCore.start(this)
         }
         return START_STICKY
     }
@@ -282,8 +285,10 @@ class MeshVpnService : VpnService() {
                     System.arraycopy(buf, 0, frame, 4, len)
 
                     val sock = udpSocket ?: continue
-                    val targetAddrs = resolvePeerTargets(dstIp)
-                    for (target in targetAddrs) {
+                    // Un solo destino: el socket aprendido de los paquetes reales del par.
+                    // Enviar por LAN y STUN a la vez duplicaba paquetes y rompía el TCP.
+                    val target = resolveBestPeerTarget(dstIp, localIp)
+                    if (target != null) {
                         try {
                             sock.send(DatagramPacket(frame, frame.size, target.address, target.port))
                         } catch (_: Exception) {
@@ -394,6 +399,16 @@ class MeshVpnService : VpnService() {
         return list
     }
 
+    /**
+     * Devuelve UN solo destino para un paquete: aprendido de los paquetes reales
+     * del par, o el primero de la ruta configurada. Nunca la IP local.
+     */
+    private fun resolveBestPeerTarget(dstVirtualIp: String, localIp: String): InetSocketAddress? {
+        if (dstVirtualIp == localIp || dstVirtualIp.startsWith("10.0.0.") && dstVirtualIp == localIp) return null
+        learnedSocketAddrs[dstVirtualIp]?.let { return it }
+        return resolvePeerTargets(dstVirtualIp).firstOrNull()
+    }
+
     private fun stopForwardLoops() {
         forwardRunning = false
         activeUdpSocket = null
@@ -442,6 +457,7 @@ class MeshVpnService : VpnService() {
 
     private fun stopMesh() {
         stopForwardLoops()
+        FileTransferCore.stop()
         if (RustCoreBridge.isNativeReady()) {
             RustCoreBridge.stopTunnel()
         }
