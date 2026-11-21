@@ -95,11 +95,32 @@ fn receive_files_p2p() -> Result<(), String> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("recibido.bin")
                 .to_string();
-            let size: usize = size_str.trim().parse().unwrap_or(0);
-            let mut buf = vec![0u8; size];
-            if reader.read_exact(&mut buf).is_ok() {
-                let _ = fs::write(&clean_name, &buf);
-                println!("[RECEPTOR] Guardado '{clean_name}' ({size} bytes)");
+            let size: u64 = size_str.trim().parse().unwrap_or(0);
+            // Streaming con buffer fijo de 64 KB y limite configurable: nunca
+            // se asigna un vector del tamano total del archivo (evita OOM).
+            let max_bytes: u64 = std::env::var("NEXOMESH_MAX_FILE_BYTES")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(2 * 1024 * 1024 * 1024);
+            if size > max_bytes {
+                eprintln!("[RECEPTOR] Rechazado '{clean_name}': {size} bytes > limite {max_bytes}");
+                continue;
+            }
+            match fs::File::create(&clean_name) {
+                Ok(mut out) => {
+                    let mut buf = [0u8; 65_536];
+                    let mut remaining = size;
+                    let mut ok = true;
+                    while remaining > 0 {
+                        let want = remaining.min(buf.len() as u64) as usize;
+                        match reader.read(&mut buf[..want]) {
+                            Ok(0) => { ok = false; break; }
+                            Ok(n) => { if out.write_all(&buf[..n]).is_err() { ok = false; break; } remaining -= n as u64; }
+                            Err(_) => { ok = false; break; }
+                        }
+                    }
+                    if ok { println!("[RECEPTOR] Guardado '{clean_name}' ({size} bytes)"); }
+                    else { eprintln!("[RECEPTOR] Transferencia incompleta de '{clean_name}'"); }
+                }
+                Err(e) => eprintln!("[RECEPTOR] No se pudo crear '{clean_name}': {e}"),
             }
         }
     }
@@ -223,7 +244,9 @@ fn main() {
     }
 
     if let Some(conf_path) = wg_conf_out {
-        export_wireguard_conf(&conf_path, "10.0.0.5", mtu, keepalive, "187.190.84.212:51820");
+        let peer_ep = std::env::var("NEXOMESH_PEER_ENDPOINT")
+            .unwrap_or_else(|_| "127.0.0.1:51820".to_string());
+        export_wireguard_conf(&conf_path, "10.0.0.5", mtu, keepalive, &peer_ep);
         println!("[EXPORT] Perfil WireGuard multiplataforma guardado en {conf_path}");
     }
 

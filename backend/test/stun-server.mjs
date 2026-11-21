@@ -30,4 +30,5 @@ server.on("message", (msg, rinfo) => {
   server.send(resp, rinfo.port, rinfo.address);
 });
 
-server.bind(port, "127.0.0.1", () => console.log(`STUN test server on 127.0.0.1:${port}`));
+server.bind(port, "0.0.0.0", () => console.log(`STUN test server on 127.0.0.1:${port}`));
+
