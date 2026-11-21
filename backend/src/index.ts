@@ -21,7 +21,7 @@ export function start(port: number = 8080, signalingPort: number = 8443): void {
   const server = createServer(app);
   server.listen(port, () => console.log(`HTTP listening on ${port}`));
   try {
-    createSignalingServer(signalingPort);
+    createSignalingServer(signalingPort, process.env.SIGNALING_REQUIRE_SIGNATURE !== "0");
     console.log(`Signaling listening on ${signalingPort}`);
   } catch (e) {
     console.error("signaling failed", e);

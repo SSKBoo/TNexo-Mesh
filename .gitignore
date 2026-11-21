@@ -40,3 +40,8 @@ screen*.png
 *.jks
 *.keystore
 *.p12
+
+# Backend SQLite local
+*.db
+*.db-shm
+*.db-wal

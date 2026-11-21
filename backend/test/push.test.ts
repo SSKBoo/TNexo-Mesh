@@ -1,10 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import express from "express";
-import { createPushRouter, _resetSubscriptions } from "../src/push.ts";
+import { createPushRouter } from "../src/push.ts";
+import { setStore, Store } from "../src/store.ts";
 
 test("push subscribe", async () => {
-  _resetSubscriptions();
+  setStore(new Store());
   const app = express();
   app.use(express.json());
   app.use("/push", createPushRouter());

@@ -1,10 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import express from "express";
-import { createInvitesRouter, _resetInvites } from "../src/invites.ts";
+import { createInvitesRouter } from "../src/invites.ts";
+import { setStore, Store } from "../src/store.ts";
 
 test("invite create and get", async () => {
-  _resetInvites();
+  setStore(new Store());
   const app = express();
   app.use(express.json());
   app.use("/", createInvitesRouter());
@@ -29,7 +30,7 @@ test("invite create and get", async () => {
 });
 
 test("invite 404 for unknown", async () => {
-  _resetInvites();
+  setStore(new Store());
   const app = express();
   app.use(express.json());
   app.use("/", createInvitesRouter());

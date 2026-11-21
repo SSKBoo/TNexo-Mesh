@@ -1,12 +1,11 @@
 import express from "express";
 import webpush from "web-push";
+import { getStore } from "./store.ts";
 
 export interface PushSubscriptionBody {
   endpoint: string;
   keys?: { p256dh?: string; auth?: string };
 }
-
-const subscriptions = new Map<string, PushSubscriptionBody>();
 
 export function configureVapid(): void {
   const pub = process.env.VAPID_PUBLIC_KEY;
@@ -26,12 +25,12 @@ export function createPushRouter(): express.Router {
       res.status(400).json({ error: "endpoint required" });
       return;
     }
-    subscriptions.set(body.endpoint, body);
+    getStore().saveSubscription(body.endpoint, body.keys);
     res.json({ ok: true });
   });
   router.post("/send", async (req, res) => {
     const { endpoint, payload } = req.body ?? {};
-    const sub = subscriptions.get(endpoint);
+    const sub = endpoint ? getStore().getSubscription(endpoint) : null;
     if (!sub) {
       res.status(404).json({ error: "subscription not found" });
       return;
@@ -44,8 +43,4 @@ export function createPushRouter(): express.Router {
     }
   });
   return router;
-}
-
-export function _resetSubscriptions(): void {
-  subscriptions.clear();
 }

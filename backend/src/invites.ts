@@ -1,5 +1,6 @@
 import express from "express";
 import crypto from "node:crypto";
+import { getStore } from "./store.ts";
 
 export interface Invite {
   id: string;
@@ -7,24 +8,17 @@ export interface Invite {
   expiresAt: number;
 }
 
-const invites = new Map<string, Invite>();
 const TTL_MS = 10 * 60 * 1000;
 
 export function createInvite(payload: unknown): Invite {
   const id = crypto.randomBytes(8).toString("hex");
   const invite: Invite = { id, payload, expiresAt: Date.now() + TTL_MS };
-  invites.set(id, invite);
+  getStore().saveInvite(id, payload, invite.expiresAt);
   return invite;
 }
 
 export function getInvite(id: string): Invite | null {
-  const inv = invites.get(id);
-  if (!inv) return null;
-  if (Date.now() > inv.expiresAt) {
-    invites.delete(id);
-    return null;
-  }
-  return inv;
+  return getStore().getInvite(id);
 }
 
 export function createInvitesRouter(): express.Router {
@@ -42,8 +36,4 @@ export function createInvitesRouter(): express.Router {
     res.json(inv);
   });
   return router;
-}
-
-export function _resetInvites(): void {
-  invites.clear();
 }

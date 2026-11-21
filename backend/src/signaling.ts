@@ -1,4 +1,5 @@
 import { WebSocket, WebSocketServer } from "ws";
+import crypto from "node:crypto";
 
 export interface SignalingSocket {
   send(data: string): void;
@@ -13,12 +14,28 @@ export interface PeerRecord {
   lastHeartbeat: number;
 }
 
+/** Verifica una firma Ed25519 del nonce con la clave pública (base64/hex). */
+export function verifySignature(publicKey: string, nonce: string, signature: string): boolean {
+  try {
+    const isHex = /^[0-9a-f]+$/i.test(publicKey) && publicKey.length === 64;
+    const keyBytes = isHex ? Buffer.from(publicKey, "hex") : Buffer.from(publicKey, "base64");
+    const sig = Buffer.from(signature, "base64");
+    const key = crypto.createPublicKey({
+      key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), keyBytes]),
+      format: "der",
+      type: "spki",
+    });
+    return crypto.verify(null, Buffer.from(nonce), key, sig);
+  } catch {
+    return false;
+  }
+}
+
 export class SignalingHub {
   private peers = new Map<string, PeerRecord>();
   private expiryMs = 5 * 60 * 1000;
 
   register(publicKey: string, socket: SignalingSocket): void {
-    // notify existing peers
     for (const [pk, rec] of this.peers) {
       if (pk !== publicKey) {
         safeSend(rec.socket, JSON.stringify({ type: "peer-joined", payload: { publicKey } }));
@@ -78,32 +95,41 @@ export class SignalingHub {
     }
   }
 
-  get size(): number {
-    return this.peers.size;
-  }
-
-  has(publicKey: string): boolean {
-    return this.peers.has(publicKey);
-  }
+  get size(): number { return this.peers.size; }
+  has(publicKey: string): boolean { return this.peers.has(publicKey); }
 }
 
 function safeSend(socket: SignalingSocket | undefined, data: string): void {
-  try {
-    socket?.send(data);
-  } catch {}
+  try { socket?.send(data); } catch {}
 }
 
-export function createSignalingServer(port: number): WebSocketServer {
+/**
+ * Servidor de señalización con challenge-response:
+ * 1. Al conectar envía { type: "challenge", nonce }.
+ * 2. El cliente responde { type: "register", from, signature } where
+ *    signature = Ed25519(nonce) con la privada asociada a `from`.
+ * 3. Solo tras verificarlo se registra el par.
+ * `requireSignature=false` mantiene compatibilidad con clientes legacy/tests.
+ */
+export function createSignalingServer(port: number, requireSignature: boolean = true): WebSocketServer {
   const wss = new WebSocketServer({ port });
   const hub = new SignalingHub();
   const sweepTimer = setInterval(() => hub.sweep(), 60000);
   wss.on("connection", (ws) => {
     let registered = false;
+    const nonce = crypto.randomBytes(32).toString("base64");
+    if (requireSignature) {
+      ws.send(JSON.stringify({ type: "challenge", nonce }));
+    }
     ws.on("message", (raw) => {
       if (!registered) {
         try {
           const msg = JSON.parse(String(raw));
           if (msg.type === "register" && msg.from) {
+            if (requireSignature && !verifySignature(msg.from, nonce, msg.signature ?? "")) {
+              ws.send(JSON.stringify({ type: "error", payload: "invalid signature" }));
+              return;
+            }
             registered = true;
             hub.register(msg.from, ws as any);
             return;

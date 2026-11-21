@@ -7,10 +7,22 @@ export interface TurnCredentials {
   ttl: number;
 }
 
-export function generateCredentials(): TurnCredentials {
-  const username = crypto.randomBytes(8).toString("hex");
-  const password = crypto.randomBytes(16).toString("hex");
-  return { username, password, ttl: 3600 };
+/** Coturn usa long-term credentials: password = HMAC-SHA1(secret, "timestamp:username"). */
+export function generateCredentials(secret?: string): TurnCredentials {
+  const ttl = 3600;
+  const timestamp = Math.floor(Date.now() / 1000) + ttl;
+  const username = `${timestamp}:${crypto.randomBytes(8).toString("hex")}`;
+  const sharedSecret = secret ?? process.env.COTURN_AUTH_SECRET ?? "nexomesh-dev-secret";
+  const password = crypto.createHmac("sha1", sharedSecret).update(username).digest("base64");
+  return { username, password, ttl };
+}
+
+export function verifyTurnPassword(username: string, password: string, secret?: string): boolean {
+  const sharedSecret = secret ?? process.env.COTURN_AUTH_SECRET ?? "nexomesh-dev-secret";
+  const expected = crypto.createHmac("sha1", sharedSecret).update(username).digest("base64");
+  const a = Buffer.from(expected);
+  const b = Buffer.from(password);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 export function createTurnRouter(): express.Router {
