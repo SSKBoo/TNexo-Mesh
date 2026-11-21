@@ -168,6 +168,7 @@ class MainActivity : AppCompatActivity() {
     private var startReceiverAfterFolderPick = false
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private lateinit var transferRepo: TransferRepository
     private val logsList = mutableListOf<LogItem>()
     private val connectedPeers = mutableListOf<PeerItem>()
     private val stagedSendItems = mutableListOf<StagedTransferItem>()
@@ -510,6 +511,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 syncPeersToVpnService()
                 appendLog("INFO", "Noise", vip, "Par P2P descubierto y enlazado: '$name' ($remoteAddr)")
+                persistState()
                 refreshAllUi()
             }
         }
@@ -519,6 +521,24 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         bottomTabViews = mutableMapOf()
+
+        transferRepo = TransferRepository(this)
+        // Restaurar historial y pares persistidos (sobreviven al cierre de la app)
+        transferRepo.loadTransfers().forEach { r ->
+            fileTransfersList.add(TransferItem(
+                id = r.id, fileName = r.fileName, sizeBytes = r.sizeBytes, direction = r.direction,
+                peerIp = r.peerIp, status = r.status, progressPct = r.progressPct,
+                errorReason = r.errorReason, localFile = r.localPath?.let { File(it) },
+                isFolder = r.isFolder, channel = r.channel
+            ))
+        }
+        transferRepo.loadPeers().forEach { r ->
+            connectedPeers.add(PeerItem(
+                id = r.id, name = r.name, virtualIp = r.virtualIp, platform = r.platform,
+                endpoint = r.endpoint, lanEndpoint = r.lanEndpoint, quarantined = r.quarantined,
+                quarantineReason = r.quarantineReason, rttMs = r.rttMs
+            ))
+        }
 
         val bootPrefs = getSharedPreferences("nexomesh_prefs", MODE_PRIVATE)
         myVirtualIp = bootPrefs.getString("my_virtual_ip", "10.0.0.1") ?: "10.0.0.1"
@@ -679,21 +699,27 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(2), dp(8), dp(2), dp(8))
         }
 
+        // Icon-First: 6 pestañas solo icono. La etiqueta queda como tooltip en
+        // pulsación larga y contentDescription para accesibilidad (plan Fase 3).
         val tabDefs = listOf(
-            AppTab.TUNNEL to "Túnel",
-            AppTab.FILES to "Archivos",
-            AppTab.CONNECT to "Conectar",
-            AppTab.GUARDIAN to "Guardián",
-            AppTab.ACTIVITY to "Estado",
-            AppTab.SETTINGS to "Ajustes"
+            Triple(AppTab.TUNNEL, "Túnel", R.drawable.ic_tab_tunnel),
+            Triple(AppTab.FILES, "Archivos", R.drawable.ic_tab_files),
+            Triple(AppTab.CONNECT, "Conectar", R.drawable.ic_tab_connect),
+            Triple(AppTab.GUARDIAN, "Guardián", R.drawable.ic_tab_guardian),
+            Triple(AppTab.ACTIVITY, "Estado", R.drawable.ic_tab_activity),
+            Triple(AppTab.SETTINGS, "Ajustes", R.drawable.ic_tab_settings)
         )
-        for ((tab, label) in tabDefs) {
+        for ((tab, label, iconRes) in tabDefs) {
             val tv = TextView(this).apply {
-                text = label
-                textSize = 10f
+                text = ""
+                contentDescription = label
                 gravity = Gravity.CENTER
-                setPadding(dp(1), dp(10), dp(1), dp(10))
+                setPadding(dp(1), dp(12), dp(1), dp(12))
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                val icon = androidx.core.content.ContextCompat.getDrawable(this@MainActivity, iconRes)
+                icon?.setBounds(0, 0, dp(26), dp(26))
+                setCompoundDrawables(null, icon, null, null)
+                tooltipText = label
                 setOnClickListener { switchTab(tab) }
             }
             bottomTabViews[tab] = tv
@@ -940,6 +966,32 @@ class MainActivity : AppCompatActivity() {
 
     private fun getLocalLanIpAddress(): String = getLocalLanIpCandidates().firstOrNull() ?: ""
 
+    /** Persiste historial y pares para que sobrevivan al cierre de la app. */
+    private fun persistState() {
+        if (!::transferRepo.isInitialized) return
+        transferRepo.saveTransfers(fileTransfersList.map { ft ->
+            TransferRepository.TransferRow(
+                id = ft.id, fileName = ft.fileName, sizeBytes = ft.sizeBytes, direction = ft.direction,
+                peerIp = ft.peerIp, status = ft.status, progressPct = ft.progressPct,
+                errorReason = ft.errorReason, localPath = ft.localFile?.absolutePath,
+                isFolder = ft.isFolder, channel = ft.channel,
+                timestamp = System.currentTimeMillis()
+            )
+        })
+        transferRepo.savePeers(connectedPeers.map { p ->
+            TransferRepository.PeerRow(
+                id = p.id, name = p.name, virtualIp = p.virtualIp, platform = p.platform,
+                endpoint = p.endpoint, lanEndpoint = p.lanEndpoint, quarantined = p.quarantined,
+                quarantineReason = p.quarantineReason, rttMs = p.rttMs
+            )
+        })
+    }
+
+    override fun onPause() {
+        super.onPause()
+        persistState()
+    }
+
     private fun syncPeersToVpnService() {
         val prefs = getSharedPreferences("nexomesh_prefs", MODE_PRIVATE)
         val list = connectedPeers.filter { !it.quarantined && it.online }.map {
@@ -1012,8 +1064,12 @@ class MainActivity : AppCompatActivity() {
         val acc = themeAccent()
         for ((t, tv) in bottomTabViews) {
             val active = t == tab
-            tv.setTextColor(Color.parseColor(if (active) acc else "#94A3B8"))
-            tv.setTypeface(null, if (active) Typeface.BOLD else Typeface.NORMAL)
+            val color = Color.parseColor(if (active) acc else "#94A3B8")
+            tv.compoundDrawables[1]?.let { d ->
+                val tinted = d.mutate()
+                tinted.setTint(color)
+                tv.setCompoundDrawables(null, tinted, null, null)
+            }
             tv.background = if (active) makeCardDrawable("#10B98120", acc, 10, 1) else null
         }
 
@@ -1211,6 +1267,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
         footerRow.addView(footerStatsText)
+        // "Simular caída" movido a Ajustes → Herramientas de depuración (plan Icon-First)
+        simulateLossBtn.visibility = View.GONE
         footerRow.addView(simulateLossBtn)
 
         tunnelKeepAliveBtn = makeStyledButton("Blindaje Anti-Cierre Android · 0/4 PASS", "#1F1A0D", "#854D0E", "#FBBF24").apply {
@@ -1385,24 +1443,29 @@ class MainActivity : AppCompatActivity() {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply { bottomMargin = dp(6) }
         }
-        fileChanVpnBtn = makeStyledButton("Túnel", "#059669", "#10B981", "#FFFFFF", 10).apply {
-            textSize = 10f
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(3) }
+        fun styleChannelButton(btn: Button, label: String, iconRes: Int) {
+            btn.text = label
+            btn.textSize = 9f
+            btn.contentDescription = label
+            val icon = androidx.core.content.ContextCompat.getDrawable(this@MainActivity, iconRes)
+            icon?.setBounds(0, 0, dp(20), dp(20))
+            btn.setCompoundDrawables(null, icon, null, null)
+            btn.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(3) }
+        }
+        fileChanVpnBtn = makeStyledButton("", "#059669", "#10B981", "#FFFFFF", 10).apply {
+            styleChannelButton(this, "Túnel", R.drawable.ic_chan_tunnel)
             setOnClickListener { fileSendChannel = "VPN"; refreshAllUi() }
         }
-        fileChanLanBtn = makeStyledButton("Red Local", themeInset(), "#334155", "#CBD5E1", 10).apply {
-            textSize = 10f
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(3) }
+        fileChanLanBtn = makeStyledButton("", themeInset(), "#334155", "#CBD5E1", 10).apply {
+            styleChannelButton(this, "LAN", R.drawable.ic_chan_lan)
             setOnClickListener { fileSendChannel = "LAN"; refreshAllUi() }
         }
-        fileChanBtBtn = makeStyledButton("Bluetooth", themeInset(), "#334155", "#CBD5E1", 10).apply {
-            textSize = 10f
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(3) }
+        fileChanBtBtn = makeStyledButton("", themeInset(), "#334155", "#CBD5E1", 10).apply {
+            styleChannelButton(this, "BT", R.drawable.ic_chan_bt)
             setOnClickListener { fileSendChannel = "BLUETOOTH"; refreshAllUi() }
         }
-        fileChanBothBtn = makeStyledButton("Ambas", themeInset(), "#334155", "#CBD5E1", 10).apply {
-            textSize = 10f
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        fileChanBothBtn = makeStyledButton("", themeInset(), "#334155", "#CBD5E1", 10).apply {
+            styleChannelButton(this, "Dual", R.drawable.ic_chan_dual)
             setOnClickListener { fileSendChannel = "LAN_BLUETOOTH"; refreshAllUi() }
         }
         channelRow.addView(fileChanVpnBtn)
@@ -2650,6 +2713,39 @@ class MainActivity : AppCompatActivity() {
         col.addView(appearanceCard)
         col.addView(deviceCard)
         col.addView(guideCard)
+
+        // Herramientas de depuración: pruebas de intrusión y simulación de caída
+        // Movidas aquí desde Guardián/Túnel para evitar pulsaciones accidentales.
+        val debugCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = makeCardDrawable(themeSurface(), themeBorder(), 18, 1)
+            setPadding(dp(18), dp(18), dp(18), dp(18))
+        }
+        val debugTitle = TextView(this).apply {
+            text = "Herramientas de depuración"
+            textSize = 14f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#F8FAFC"))
+            setPadding(0, 0, 0, dp(10))
+        }
+        debugCard.addView(debugTitle)
+        val debugRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val debugLossBtn = makeStyledButton("Simular caída", "#2A1215", "#7F1D1D", "#FCA5A5", 10).apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(3) }
+            setOnClickListener {
+                vpnRunning = true
+                triggerLossAndExponentialBackoff()
+                refreshAllUi()
+            }
+        }
+        val debugFloodBtn = makeStyledButton("Flood UDP", "#450A0A", "#EF4444", "#FCA5A5", 10).apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(3) }
+            setOnClickListener { triggerDefenseAttackTest("Flood UDP") }
+        }
+        debugRow.addView(debugLossBtn)
+        debugRow.addView(debugFloodBtn)
+        debugCard.addView(debugRow)
+        col.addView(debugCard)
         scroll.addView(col)
         return scroll
     }
@@ -4467,6 +4563,7 @@ class MainActivity : AppCompatActivity() {
                     ftItem.status = "completed"
                     ftItem.progressPct = 100
                     appendLog("INFO", "WireGuard", targetIp, "Archivo '$fileName' (${formatBytes(sendSize)}) confirmado por el receptor sha256=${parts[3].take(12)}... vía $channelLabel ($usedHost:51821)")
+                    persistState()
                     refreshAllUi()
                 }
             }
@@ -4773,6 +4870,7 @@ class MainActivity : AppCompatActivity() {
                 ))
                 fileReceiverActive = true
                 appendLog("INFO", "WireGuard", r.senderIp, "Recibido '${r.name}' (${formatBytes(r.size)}) sha256=${r.sha256.take(12)}...")
+                persistState()
                 refreshAllUi()
             }
         }
@@ -4822,17 +4920,23 @@ class MainActivity : AppCompatActivity() {
                     // envío/recepción cuando se escriben bytes. Nunca un temporizador simulado.
                 }
                 if (waveTick % 4 == 0) {
-                    val phase = waveTick * 0.25
-                    val nextRtt = if (backoffAttempt > 0 || !vpnRunning) 0f else (20f + (sin(phase) * 5f).toFloat())
-                    val nextRx = if (backoffAttempt > 0 || !vpnRunning) 0f else (68f + (sin(phase * 0.7) * 10f).toFloat())
-                    val nextTx = if (backoffAttempt > 0 || !vpnRunning) 0f else (54f + (sin(phase * 0.9) * 8f).toFloat())
+                    // Telemetría REAL desde MeshVpnService: contadores atómicos de bytes
+                    // y RTT medido NM_HELLO -> NM_ACK. Sin ondas sin(phase) simuladas.
+                    val rxBytes = MeshVpnService.bytesReceivedTotal
+                    val txBytes = MeshVpnService.bytesSentTotal
+                    val rttMs = MeshVpnService.lastRttMs
+                    val nextRtt = if (vpnRunning && backoffAttempt == 0) rttMs.toFloat() else 0f
+                    // Velocidad en Mbps derivada de los bytes acumulados en la ventana
+                    val nextRx = if (vpnRunning && backoffAttempt == 0) (rxBytes * 8f / 1_000_000f / 2f) else 0f
+                    val nextTx = if (vpnRunning && backoffAttempt == 0) (txBytes * 8f / 1_000_000f / 2f) else 0f
                     rttHistory.add(nextRtt); if (rttHistory.size > 24) rttHistory.removeAt(0)
                     rxHistory.add(nextRx); if (rxHistory.size > 24) rxHistory.removeAt(0)
                     txHistory.add(nextTx); if (txHistory.size > 24) txHistory.removeAt(0)
                     val nowRttTs = System.currentTimeMillis()
-                    for ((pIdx, p) in connectedPeers.withIndex()) {
+                    for (p in connectedPeers) {
                         if (p.online && !p.quarantined && vpnRunning && backoffAttempt == 0) {
-                            p.rttMs = maxOf(8, (nextRtt + (pIdx * 4)).toInt())
+                            val real = MeshVpnService.getPeerRttMs(p.virtualIp)
+                            if (real > 0) p.rttMs = real.toInt()
                         }
                         val series = peerRtt60sHistory.getOrPut(p.id) { mutableListOf() }
                         val sampleRtt = if (p.online && !p.quarantined && vpnRunning && backoffAttempt == 0) p.rttMs.toFloat() else -1f
@@ -6004,6 +6108,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        persistState()
         fileReceiverActive = false
         try { fileServerSocket?.close() } catch (_: Exception) {}
         pendingLossRunnable?.let { mainHandler.removeCallbacks(it) }

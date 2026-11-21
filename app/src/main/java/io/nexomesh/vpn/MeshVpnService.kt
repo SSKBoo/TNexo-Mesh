@@ -60,6 +60,46 @@ class MeshVpnService : VpnService() {
         @Volatile
         var blockedPacketsCount: Long = 0L
 
+        // Telemetría real: contadores atómicos y RTT medido NM_HELLO -> NM_ACK
+        @Volatile
+        var bytesSentTotal: Long = 0L
+            private set
+
+        @Volatile
+        var bytesReceivedTotal: Long = 0L
+            private set
+
+        private val helloSentAtMs = ConcurrentHashMap<String, Long>()
+
+        @Volatile
+        var lastRttMs: Long = 0L
+            private set
+
+        private val rttByPeer = ConcurrentHashMap<String, Long>()
+
+        fun getPeerRttMs(peerVip: String): Long = rttByPeer[peerVip] ?: 0L
+
+        fun recordHelloSent(peerVip: String) {
+            helloSentAtMs[peerVip] = System.currentTimeMillis()
+        }
+
+        fun recordAckReceived(peerVip: String) {
+            val sent = helloSentAtMs.remove(peerVip) ?: return
+            val rtt = (System.currentTimeMillis() - sent).coerceIn(1L, 10_000L)
+            lastRttMs = rtt
+            rttByPeer[peerVip] = rtt
+        }
+
+        fun addTxBytes(n: Int) { bytesSentTotal += n }
+
+        fun addRxBytes(n: Int) { bytesReceivedTotal += n }
+
+        fun resetCounters() {
+            bytesSentTotal = 0L
+            bytesReceivedTotal = 0L
+            lastRttMs = 0L
+        }
+
         val quarantinedIps = java.util.Collections.synchronizedSet(mutableSetOf<String>())
         val peerRoutes = ConcurrentHashMap<String, PeerEndpointInfo>()
         val learnedSocketAddrs = ConcurrentHashMap<String, InetSocketAddress>()
@@ -307,6 +347,7 @@ class MeshVpnService : VpnService() {
                     if (target != null) {
                         try {
                             sock.send(DatagramPacket(frame, frame.size, target.address, target.port))
+                            addTxBytes(len)
                         } catch (_: Exception) {
                         }
                     }
@@ -337,6 +378,10 @@ class MeshVpnService : VpnService() {
                                 val remote = InetSocketAddress(pkt.address, pkt.port)
                                 learnedSocketAddrs[peerVip] = remote
                                 peerDiscoveredListener?.invoke(peerVip, peerName, "$senderIp:${pkt.port}")
+                                if (msg.startsWith("NM_ACK|")) {
+                                    // ACK recibido: medimos RTT real desde el HELLO enviado a este par
+                                    recordAckReceived(peerVip)
+                                }
                                 if (msg.startsWith("NM_HELLO|")) {
                                     val ack = "NM_ACK|$localIp|${Build.MODEL}|direct".toByteArray(Charsets.UTF_8)
                                     try {
@@ -373,6 +418,7 @@ class MeshVpnService : VpnService() {
                                 learnedSocketAddrs[senderVip] = InetSocketAddress(pkt.address, pkt.port)
                             }
                             synchronized(lockWrite) { tunOut.write(packet, 0, packet.size) }
+                            addRxBytes(packet.size)
                         }
                     }
                 } catch (_: Exception) {
@@ -393,6 +439,7 @@ class MeshVpnService : VpnService() {
                             for (target in resolvePeerTargets(peer.virtualIp)) {
                                 try {
                                     sock.send(DatagramPacket(hello, hello.size, target.address, target.port))
+                                    recordHelloSent(peer.virtualIp)
                                 } catch (_: Exception) {
                                 }
                             }
