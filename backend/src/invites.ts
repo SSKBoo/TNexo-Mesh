@@ -13,7 +13,14 @@ const TTL_MS = 10 * 60 * 1000;
 export function createInvite(payload: unknown): Invite {
   const id = crypto.randomBytes(8).toString("hex");
   const invite: Invite = { id, payload, expiresAt: Date.now() + TTL_MS };
-  getStore().saveInvite(id, payload, invite.expiresAt);
+  const store = getStore();
+  store.saveInvite(id, payload, invite.expiresAt);
+  // Si la invitación trae ambas llaves, las enlazamos para que el signaling
+  // exija que `from` (firma Ed25519) corresponda a una identidad de malla invitada.
+  const p = payload as { pk?: string; signingPub?: string };
+  if (p?.pk && p?.signingPub) {
+    store.linkSigningKey(p.pk, p.signingPub);
+  }
   return invite;
 }
 

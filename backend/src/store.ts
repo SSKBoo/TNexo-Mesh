@@ -35,6 +35,26 @@ export class Store {
     this.db.prepare("DELETE FROM invites WHERE expires_at < ?").run(Date.now());
   }
 
+  // --- enlace identidad de malla (X25519) <-> firma signaling (Ed25519) ---
+  linkSigningKey(meshPubKey: string, signingPubKey: string): void {
+    this.db.prepare(
+      "INSERT OR REPLACE INTO signing_keys (mesh_pub_key, signing_pub_key) VALUES (?, ?)"
+    ).run(meshPubKey, signingPubKey);
+  }
+
+  isAuthorizedSigningKey(signingPubKey: string): boolean {
+    return !!this.db.prepare(
+      "SELECT 1 FROM signing_keys WHERE signing_pub_key = ?"
+    ).get(signingPubKey);
+  }
+
+  getMeshKeyForSigningKey(signingPubKey: string): string | null {
+    const row = this.db.prepare(
+      "SELECT mesh_pub_key FROM signing_keys WHERE signing_pub_key = ?"
+    ).get(signingPubKey) as { mesh_pub_key: string } | undefined;
+    return row?.mesh_pub_key ?? null;
+  }
+
   // --- push subscriptions ---
   saveSubscription(endpoint: string, keys: unknown): void {
     this.db.prepare(

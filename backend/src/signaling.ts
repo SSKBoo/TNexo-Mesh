@@ -111,7 +111,11 @@ function safeSend(socket: SignalingSocket | undefined, data: string): void {
  * 3. Solo tras verificarlo se registra el par.
  * `requireSignature=false` mantiene compatibilidad con clientes legacy/tests.
  */
-export function createSignalingServer(port: number, requireSignature: boolean = true): WebSocketServer {
+export function createSignalingServer(
+  port: number,
+  requireSignature: boolean = true,
+  isAuthorized: (from: string) => boolean = () => true
+): WebSocketServer {
   const wss = new WebSocketServer({ port });
   const hub = new SignalingHub();
   const sweepTimer = setInterval(() => hub.sweep(), 60000);
@@ -128,6 +132,10 @@ export function createSignalingServer(port: number, requireSignature: boolean = 
           if (msg.type === "register" && msg.from) {
             if (requireSignature && !verifySignature(msg.from, nonce, msg.signature ?? "")) {
               ws.send(JSON.stringify({ type: "error", payload: "invalid signature" }));
+              return;
+            }
+            if (requireSignature && !isAuthorized(msg.from)) {
+              ws.send(JSON.stringify({ type: "error", payload: "unauthorized identity" }));
               return;
             }
             registered = true;

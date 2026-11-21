@@ -13,6 +13,10 @@ export function openDb(path: string = ":memory:"): Database.Database {
       payload TEXT,
       expires_at INTEGER
     );
+    CREATE TABLE IF NOT EXISTS signing_keys (
+      mesh_pub_key TEXT PRIMARY KEY,
+      signing_pub_key TEXT NOT NULL
+    );
   `);
   return db;
 }
