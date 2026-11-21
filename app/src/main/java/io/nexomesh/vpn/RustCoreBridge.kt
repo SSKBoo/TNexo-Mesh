@@ -20,4 +20,9 @@ object RustCoreBridge {
     external fun setDefensePolicy(bunkerMode: Boolean, maxPps: Int)
     external fun getBlockedPacketsCount(): Long
     external fun inspectPacket(payloadLen: Int, dstPort: Int): Boolean
+
+    // Data plane cifrado (X25519 ECDH + ChaCha20-Poly1305)
+    external fun initSession(peerId: String, localKey: String, peerKey: String): Boolean
+    external fun sealPacket(peerId: String, plaintext: ByteArray): ByteArray
+    external fun openPacket(peerId: String, frame: ByteArray): ByteArray
 }

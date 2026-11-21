@@ -26,7 +26,8 @@ class MeshVpnService : VpnService() {
         val virtualIp: String,
         val name: String,
         val stunEndpoint: String,
-        val lanEndpoint: String
+        val lanEndpoint: String,
+        val peerPublicKey: String = ""
     )
 
     companion object {
@@ -46,6 +47,9 @@ class MeshVpnService : VpnService() {
 
         @Volatile
         var localVirtualIp: String = "10.0.0.1"
+
+        @Volatile
+        var localPublicKey: String = ""
 
         @Volatile
         var bunkerMode: Boolean = false
@@ -86,6 +90,10 @@ class MeshVpnService : VpnService() {
             }
             for (item in list) {
                 peerRoutes[item.virtualIp] = item
+                // Inicializar sesión cifrada con este par (X25519 + ChaCha20-Poly1305)
+                if (RustCoreBridge.isNativeReady() && item.peerPublicKey.isNotBlank()) {
+                    RustCoreBridge.initSession(item.virtualIp, localPublicKey, item.peerPublicKey)
+                }
             }
         }
 
@@ -154,6 +162,7 @@ class MeshVpnService : VpnService() {
         val savedIp = prefs.getString("my_virtual_ip", "10.0.0.1") ?: "10.0.0.1"
         val localIp = intent?.getStringExtra("VIRTUAL_IP") ?: savedIp
         localVirtualIp = localIp
+        localPublicKey = prefs.getString("host_pub_key", "") ?: ""
         val mtu = intent?.getIntExtra("MTU", 1280) ?: 1280
         val keepalive = intent?.getIntExtra("KEEPALIVE_SEC", 15) ?: 15
         val stun = intent?.getStringExtra("STUN_SERVER") ?: "stun.l.google.com:19302"
@@ -277,12 +286,19 @@ class MeshVpnService : VpnService() {
                         continue
                     }
 
-                    val frame = ByteArray(4 + len)
+                    // frame: NM1 | len(senderVip) | senderVip | ciphertext(AEAD)
+                    val senderBytes = localIp.toByteArray(Charsets.UTF_8)
+                    val packet = buf.copyOfRange(0, len)
+                    val encrypted = if (RustCoreBridge.isNativeReady()) {
+                        RustCoreBridge.sealPacket(dstIp, packet)
+                    } else packet
+                    val frame = ByteArray(4 + senderBytes.size + encrypted.size)
                     frame[0] = 'N'.code.toByte()
                     frame[1] = 'M'.code.toByte()
                     frame[2] = '1'.code.toByte()
-                    frame[3] = 0x01
-                    System.arraycopy(buf, 0, frame, 4, len)
+                    frame[3] = senderBytes.size.toByte()
+                    System.arraycopy(senderBytes, 0, frame, 4, senderBytes.size)
+                    System.arraycopy(encrypted, 0, frame, 4 + senderBytes.size, encrypted.size)
 
                     val sock = udpSocket ?: continue
                     // Un solo destino: el socket aprendido de los paquetes reales del par.
@@ -331,18 +347,32 @@ class MeshVpnService : VpnService() {
                             }
                         }
                     } else if (rxBuf[0] == 'N'.code.toByte() && rxBuf[1] == 'M'.code.toByte() && rxBuf[2] == '1'.code.toByte() && len >= 24) {
-                        val ipLen = len - 4
-                        if (((rxBuf[4].toInt() ushr 4) and 0x0F) != 4) continue
-                        val srcIp = "${rxBuf[16].toInt() and 0xFF}.${rxBuf[17].toInt() and 0xFF}.${rxBuf[18].toInt() and 0xFF}.${rxBuf[19].toInt() and 0xFF}"
-                        if (quarantinedIps.contains(srcIp)) {
-                            blockedPacketsCount += 1L
-                            continue
-                        }
-                        if (srcIp.startsWith("10.0.0.") && srcIp != localIp && pkt.address != null) {
-                            learnedSocketAddrs[srcIp] = InetSocketAddress(pkt.address, pkt.port)
-                        }
-                        synchronized(lockWrite) {
-                            tunOut.write(rxBuf, 4, ipLen)
+                        if (rxBuf[3] == 0x01.toByte()) {
+                            // Formato legacy (plaintext) por compatibilidad
+                            val ipLen = len - 4
+                            if (((rxBuf[4].toInt() ushr 4) and 0x0F) != 4) continue
+                            val srcIp = "${rxBuf[16].toInt() and 0xFF}.${rxBuf[17].toInt() and 0xFF}.${rxBuf[18].toInt() and 0xFF}.${rxBuf[19].toInt() and 0xFF}"
+                            if (quarantinedIps.contains(srcIp)) { blockedPacketsCount += 1L; continue }
+                            if (srcIp.startsWith("10.0.0.") && srcIp != localIp && pkt.address != null) {
+                                learnedSocketAddrs[srcIp] = InetSocketAddress(pkt.address, pkt.port)
+                            }
+                            synchronized(lockWrite) { tunOut.write(rxBuf, 4, ipLen) }
+                        } else {
+                            // Formato cifrado: NM1 | len(senderVip) | senderVip | ciphertext
+                            val senderLen = rxBuf[3].toInt() and 0xFF
+                            if (senderLen <= 0 || 4 + senderLen >= len) continue
+                            val senderVip = String(rxBuf, 4, senderLen, Charsets.UTF_8)
+                            val frame = rxBuf.copyOfRange(4 + senderLen, len)
+                            val packet = if (RustCoreBridge.isNativeReady()) {
+                                RustCoreBridge.openPacket(senderVip, frame)
+                            } else frame
+                            if (packet.isEmpty() || ((packet[0].toInt() ushr 4) and 0x0F) != 4) continue
+                            val srcIp = "${packet[12].toInt() and 0xFF}.${packet[13].toInt() and 0xFF}.${packet[14].toInt() and 0xFF}.${packet[15].toInt() and 0xFF}"
+                            if (quarantinedIps.contains(srcIp)) { blockedPacketsCount += 1L; continue }
+                            if (senderVip.startsWith("10.0.0.") && senderVip != localIp && pkt.address != null) {
+                                learnedSocketAddrs[senderVip] = InetSocketAddress(pkt.address, pkt.port)
+                            }
+                            synchronized(lockWrite) { tunOut.write(packet, 0, packet.size) }
                         }
                     }
                 } catch (_: Exception) {

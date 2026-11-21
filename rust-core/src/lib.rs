@@ -1,6 +1,7 @@
-﻿pub mod crypto;
+pub mod crypto;
 pub mod keys;
 pub mod noise;
+pub mod session;
 pub mod tunnel;
 pub mod routing;
 pub mod stun;
@@ -218,3 +219,57 @@ pub extern "C" fn nexomesh_send_file(_peer: *const c_char, _path: *const c_char)
 
 #[no_mangle]
 pub extern "C" fn nexomesh_on_event(_cb: extern "C" fn(*const c_char)) {}
+
+// ---------------------------------------------------------------------------
+// JNI: cifrado del data plane del tunel (session.rs)
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_initSession(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id: JString,
+    local_key: JString,
+    peer_key: JString,
+) -> jboolean {
+    let pid: String = env.get_string(&peer_id).map(|s| s.into()).unwrap_or_default();
+    let lk: String = env.get_string(&local_key).map(|s| s.into()).unwrap_or_default();
+    let pk: String = env.get_string(&peer_key).map(|s| s.into()).unwrap_or_default();
+    match session::ensure_session(&pid, &lk, &pk) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
+}
+
+/// Devuelve el frame cifrado o un array vacio si falla.
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_sealPacket<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    peer_id: JString,
+    plaintext: jni::objects::JByteArray,
+) -> jni::objects::JByteArray<'a> {
+    let empty = env.byte_array_from_slice(&[]).unwrap_or(jni::objects::JByteArray::default());
+    let pid: String = match env.get_string(&peer_id) { Ok(s) => s.into(), Err(_) => return empty };
+    let data: Vec<u8> = match env.convert_byte_array(plaintext) { Ok(v) => v, Err(_) => return empty };
+    match session::seal(&pid, &data) {
+        Ok(out) => env.byte_array_from_slice(&out).unwrap_or(empty),
+        Err(_) => empty,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_openPacket<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    peer_id: JString,
+    frame: jni::objects::JByteArray,
+) -> jni::objects::JByteArray<'a> {
+    let empty = env.byte_array_from_slice(&[]).unwrap_or(jni::objects::JByteArray::default());
+    let pid: String = match env.get_string(&peer_id) { Ok(s) => s.into(), Err(_) => return empty };
+    let data: Vec<u8> = match env.convert_byte_array(frame) { Ok(v) => v, Err(_) => return empty };
+    match session::open(&pid, &data) {
+        Ok(out) => env.byte_array_from_slice(&out).unwrap_or(empty),
+        Err(_) => empty,
+    }
+}

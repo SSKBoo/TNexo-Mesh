@@ -941,8 +941,10 @@ class MainActivity : AppCompatActivity() {
     private fun getLocalLanIpAddress(): String = getLocalLanIpCandidates().firstOrNull() ?: ""
 
     private fun syncPeersToVpnService() {
+        val prefs = getSharedPreferences("nexomesh_prefs", MODE_PRIVATE)
         val list = connectedPeers.filter { !it.quarantined && it.online }.map {
-            MeshVpnService.PeerEndpointInfo(it.virtualIp, it.name, it.endpoint, it.lanEndpoint)
+            val peerPk = prefs.getString("peer_pk_${it.virtualIp}", "") ?: ""
+            MeshVpnService.PeerEndpointInfo(it.virtualIp, it.name, it.endpoint, it.lanEndpoint, peerPk)
         }
         MeshVpnService.updatePeers(list)
     }

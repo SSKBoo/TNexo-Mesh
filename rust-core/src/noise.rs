@@ -20,6 +20,44 @@ pub fn pattern() -> &'static str {
     NOISE_PATTERN
 }
 
+/// Handshake con efímeros fijos: permite que dos extremos que conocen las mismas
+/// claves estáticas deriven transportes espejo sin intercambiar mensajes de
+/// handshake por la red (necesario para el data plane del túnel).
+pub fn handshake_with_ephemerals(
+    initiator_priv: &[u8],
+    responder_pub: &[u8],
+    responder_priv: &[u8],
+    psk: &[u8; PSK_LEN],
+    e_init: &[u8],
+    e_resp: &[u8],
+) -> Result<NoisePair, snow::Error> {
+    let mut initiator = Builder::new(params())
+        .local_private_key(initiator_priv)?
+        .remote_public_key(responder_pub)?
+        .psk(2, psk)?
+        .fixed_ephemeral_key_for_testing_only(e_init)
+        .build_initiator()?;
+
+    let mut responder = Builder::new(params())
+        .local_private_key(responder_priv)?
+        .psk(2, psk)?
+        .fixed_ephemeral_key_for_testing_only(e_resp)
+        .build_responder()?;
+
+    let mut b1 = [0u8; 1024];
+    let mut b2 = [0u8; 1024];
+    let mut read = [0u8; 1024];
+    let n1 = initiator.write_message(&[], &mut b1)?;
+    responder.read_message(&b1[..n1], &mut read)?;
+    let n2 = responder.write_message(&[], &mut b2)?;
+    initiator.read_message(&b2[..n2], &mut read)?;
+
+    Ok(NoisePair {
+        initiator: NoiseSession { transport: initiator.into_transport_mode()? },
+        responder: NoiseSession { transport: responder.into_transport_mode()? },
+    })
+}
+
 /// Sesión de transporte cifrada tras completar el handshake.
 pub struct NoiseSession {
     transport: TransportState,
