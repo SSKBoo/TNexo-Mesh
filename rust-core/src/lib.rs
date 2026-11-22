@@ -3,6 +3,7 @@ pub mod keys;
 pub mod noise;
 pub mod session;
 pub mod derp;
+pub mod ws_client;
 pub mod tunnel;
 pub mod routing;
 pub mod stun;

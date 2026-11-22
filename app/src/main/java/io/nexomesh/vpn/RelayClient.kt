@@ -9,6 +9,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okio.ByteString
 import org.json.JSONObject
 import java.util.Base64
 
@@ -19,6 +20,7 @@ import java.util.Base64
 object RelayClient {
     private const val TAG = "NexoMeshRelay"
     private var socket: WebSocket? = null
+    @Volatile
     private var connected = false
     private var currentUrl: String = ""
     private var identity: String = ""
@@ -28,32 +30,62 @@ object RelayClient {
     var onFrameReceived: ((ByteArray) -> Unit)? = null
 
     fun connect(url: String, signingIdentity: String, signature: String) {
+        connect(url, signingIdentity, signature, null)
+    }
+
+    fun connect(
+        url: String,
+        signingIdentity: String,
+        fallbackSignature: String = "",
+        signNonce: ((String) -> String)? = null
+    ) {
+        if (url.isBlank()) return
+        close()
         currentUrl = url
         identity = signingIdentity
         val req = Request.Builder().url(url).build()
         socket = client.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
-                ws.send(JSONObject().apply {
-                    put("type", "register")
-                    put("from", signingIdentity)
-                    // El backend valida la firma del challenge; aquí registramos
-                    // la identidad de firma. El challenge-response se completó en
-                    // el flujo de señalización (ver docs/KEY_MODEL.md).
-                    put("signature", signature)
-                }.toString())
-                connected = true
-                Log.i(TAG, "relay WS conectado")
+                if (signNonce == null) {
+                    ws.send(JSONObject().apply {
+                        put("type", "register")
+                        put("from", signingIdentity)
+                        put("signature", fallbackSignature)
+                    }.toString())
+                    connected = true
+                    Log.i(TAG, "relay WS conectado (sin challenge)")
+                }
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
                 try {
                     val msg = JSONObject(text)
-                    if (msg.optString("type") == "relay") {
-                        val data = Base64.getDecoder().decode(msg.optString("data"))
-                        onFrameReceived?.invoke(data)
+                    when (msg.optString("type")) {
+                        "challenge" -> {
+                            val nonce = msg.optString("nonce")
+                            val sig = signNonce?.invoke(nonce) ?: fallbackSignature
+                            ws.send(JSONObject().apply {
+                                put("type", "register")
+                                put("from", signingIdentity)
+                                put("signature", sig)
+                            }.toString())
+                            connected = true
+                            Log.i(TAG, "relay WS registrado tras challenge")
+                        }
+                        "relay" -> {
+                            val data = Base64.getDecoder().decode(msg.optString("data"))
+                            onFrameReceived?.invoke(data)
+                        }
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "mensaje relay inválido: ${e.message}")
+                }
+            }
+
+            override fun onMessage(ws: WebSocket, bytes: ByteString) {
+                val raw = bytes.toByteArray()
+                if (raw.size >= 6 && raw[0] == 'N'.code.toByte() && raw[1] == 'M'.code.toByte() && raw[2] == '1'.code.toByte()) {
+                    onFrameReceived?.invoke(raw)
                 }
             }
 

@@ -20,6 +20,11 @@ android {
     }
 
     buildTypes {
+        debug {
+            ndk {
+                abiFilters += listOf("x86_64")
+            }
+        }
         release {
             isMinifyEnabled = false
         }

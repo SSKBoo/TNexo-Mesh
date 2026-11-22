@@ -103,6 +103,7 @@ class MeshVpnService : VpnService() {
         val quarantinedIps = java.util.Collections.synchronizedSet(mutableSetOf<String>())
         val peerRoutes = ConcurrentHashMap<String, PeerEndpointInfo>()
         val learnedSocketAddrs = ConcurrentHashMap<String, InetSocketAddress>()
+        val lastDirectRxMs = ConcurrentHashMap<String, Long>()
 
         @Volatile
         private var activeUdpSocket: DatagramSocket? = null
@@ -126,13 +127,15 @@ class MeshVpnService : VpnService() {
                 if (!activeIps.contains(k)) {
                     peerRoutes.remove(k)
                     learnedSocketAddrs.remove(k)
+                    lastDirectRxMs.remove(k)
                 }
             }
             for (item in list) {
                 peerRoutes[item.virtualIp] = item
                 // Inicializar sesión cifrada con este par (X25519 + ChaCha20-Poly1305)
-                if (RustCoreBridge.isNativeReady() && item.peerPublicKey.isNotBlank()) {
-                    RustCoreBridge.initSession(item.virtualIp, localPublicKey, item.peerPublicKey)
+                if (RustCoreBridge.isNativeReady() && localPublicKey.isNotBlank() && item.peerPublicKey.isNotBlank()) {
+                    val ok = RustCoreBridge.initSession(item.virtualIp, localPublicKey, item.peerPublicKey)
+                    android.util.Log.i("NexoMeshRelay", "initSession(${item.virtualIp})=$ok")
                 }
             }
         }
@@ -203,6 +206,15 @@ class MeshVpnService : VpnService() {
         val localIp = intent?.getStringExtra("VIRTUAL_IP") ?: savedIp
         localVirtualIp = localIp
         localPublicKey = prefs.getString("host_pub_key", "") ?: ""
+        if (RustCoreBridge.isNativeReady() && localPublicKey.isNotBlank()) {
+            for (item in peerRoutes.values) {
+                val pk = item.peerPublicKey.ifBlank { prefs.getString("peer_pk_${item.virtualIp}", "") ?: "" }
+                if (pk.isNotBlank()) {
+                    val ok = RustCoreBridge.initSession(item.virtualIp, localPublicKey, pk)
+                    android.util.Log.i("NexoMeshRelay", "onStart initSession(${item.virtualIp})=$ok")
+                }
+            }
+        }
         val mtu = intent?.getIntExtra("MTU", 1280) ?: 1280
         val keepalive = intent?.getIntExtra("KEEPALIVE_SEC", 15) ?: 15
         val stun = intent?.getStringExtra("STUN_SERVER") ?: "stun.l.google.com:19302"
@@ -214,6 +226,7 @@ class MeshVpnService : VpnService() {
         }
 
         if (tunFd != null && activeIp == localIp && activeMtu == mtu && forwardRunning) {
+            ensureRelayConnected(intent, prefs, localIp)
             return START_STICKY
         }
 
@@ -251,11 +264,25 @@ class MeshVpnService : VpnService() {
         }
         if (tunFd != null) {
             startForwardLoops(localIp, keepalive)
+            ensureRelayConnected(intent, prefs, localIp)
             // El receptor :51821 vive en el servicio, no en la Activity: arranca
             // automaticamente con la VPN y sobrevive a recreaciones de pantalla.
             FileTransferCore.start(this)
         }
         return START_STICKY
+    }
+
+    private fun ensureRelayConnected(
+        intent: Intent?,
+        prefs: android.content.SharedPreferences,
+        localIp: String
+    ) {
+        val relayUrl = intent?.getStringExtra("RELAY_URL")
+            ?: prefs.getString("relay_url", "") ?: ""
+        if (relayUrl.isNotBlank() && !RelayClient.isConnected()) {
+            val id = localPublicKey.ifBlank { localIp }
+            RelayClient.connect(relayUrl, id, "")
+        }
     }
 
     private fun acquireWakeLock() {
@@ -307,6 +334,8 @@ class MeshVpnService : VpnService() {
                             if (packet.isNotEmpty() && ((packet[0].toInt() ushr 4) and 0x0F) == 4) {
                                 synchronized(lockWrite) { tunOut.write(packet, 0, packet.size) }
                                 addRxBytes(packet.size)
+                            } else {
+                                android.util.Log.w("NexoMeshRelay", "openPacket vacío/inválido desde $senderVip (${frame.size}B)")
                             }
                         }
                     }
@@ -353,6 +382,10 @@ class MeshVpnService : VpnService() {
                     val encrypted = if (RustCoreBridge.isNativeReady()) {
                         RustCoreBridge.sealPacket(dstIp, packet)
                     } else packet
+                    if (encrypted.isEmpty()) {
+                        android.util.Log.w("NexoMeshRelay", "sealPacket vacío para $dstIp (sin sesión)")
+                        continue
+                    }
                     val frame = ByteArray(4 + senderBytes.size + encrypted.size)
                     frame[0] = 'N'.code.toByte()
                     frame[1] = 'M'.code.toByte()
@@ -362,11 +395,13 @@ class MeshVpnService : VpnService() {
                     System.arraycopy(encrypted, 0, frame, 4 + senderBytes.size, encrypted.size)
 
                     val sock = udpSocket ?: continue
-                    // Un solo destino: el socket aprendido de los paquetes reales del par.
-                    // Enviar por LAN y STUN a la vez duplicaba paquetes y rompía el TCP.
+                    // Directo UDP solo si hubo tráfico/ACK reciente (<15s); si no,
+                    // usar relay WSS (tipo Tailscale DERP) mientras sigue el hole-punch.
+                    val directFresh = learnedSocketAddrs[dstIp] != null &&
+                        (System.currentTimeMillis() - (lastDirectRxMs[dstIp] ?: 0L)) <= 15_000L
                     val target = resolveBestPeerTarget(dstIp, localIp)
                     var sent = false
-                    if (target != null) {
+                    if (directFresh && target != null) {
                         try {
                             sock.send(DatagramPacket(frame, frame.size, target.address, target.port))
                             addTxBytes(len)
@@ -375,8 +410,18 @@ class MeshVpnService : VpnService() {
                         }
                     }
                     if (!sent && RelayClient.isConnected()) {
-                        // Fallback DERP: UDP directo no disponible -> relay WSS
-                        if (RelayClient.send(frame)) addTxBytes(len)
+                        // Fallback DERP: UDP directo no confirmado -> relay WSS
+                        if (RelayClient.send(frame)) {
+                            addTxBytes(len)
+                            sent = true
+                        }
+                    }
+                    if (!sent && target != null) {
+                        try {
+                            sock.send(DatagramPacket(frame, frame.size, target.address, target.port))
+                            addTxBytes(len)
+                        } catch (_: Exception) {
+                        }
                     }
                 } catch (_: Exception) {
                     if (!forwardRunning) break
@@ -412,6 +457,7 @@ class MeshVpnService : VpnService() {
                             if (peerVip.startsWith("10.0.0.") && peerVip != localIp && senderIp.isNotEmpty()) {
                                 val remote = InetSocketAddress(pkt.address, pkt.port)
                                 learnedSocketAddrs[peerVip] = remote
+                                lastDirectRxMs[peerVip] = System.currentTimeMillis()
                                 peerDiscoveredListener?.invoke(peerVip, peerName, "$senderIp:${pkt.port}")
                                 if (msg.startsWith("NM_ACK|")) {
                                     // ACK recibido: medimos RTT real desde el HELLO enviado a este par
@@ -451,6 +497,7 @@ class MeshVpnService : VpnService() {
                             if (quarantinedIps.contains(srcIp)) { blockedPacketsCount += 1L; continue }
                             if (senderVip.startsWith("10.0.0.") && senderVip != localIp && pkt.address != null) {
                                 learnedSocketAddrs[senderVip] = InetSocketAddress(pkt.address, pkt.port)
+                                lastDirectRxMs[senderVip] = System.currentTimeMillis()
                             }
                             synchronized(lockWrite) { tunOut.write(packet, 0, packet.size) }
                             addRxBytes(packet.size)
@@ -594,6 +641,7 @@ class MeshVpnService : VpnService() {
 
     private fun stopMesh() {
         stopForwardLoops()
+        RelayClient.close()
         FileTransferCore.stop()
         if (RustCoreBridge.isNativeReady()) {
             RustCoreBridge.stopTunnel()

@@ -1,0 +1,21 @@
+{
+  "name": "TNexo-Mesh (Codespaces Relay & Rust CLI)",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    }
+  },
+  "forwardPorts": [8080, 8443],
+  "portsAttributes": {
+    "8080": {
+      "label": "NexoMesh Backend HTTP + WS (/ws)",
+      "onAutoForward": "notify"
+    },
+    "8443": {
+      "label": "NexoMesh Signaling/DERP WS",
+      "onAutoForward": "silent"
+    }
+  },
+  "postCreateCommand": "cd backend && npm ci && cd ../rust-core && cargo build --bin nexomesh-cli"
+}

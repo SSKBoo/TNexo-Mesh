@@ -990,6 +990,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun syncPeersToVpnService() {
         val prefs = getSharedPreferences("nexomesh_prefs", MODE_PRIVATE)
+        if (MeshVpnService.localPublicKey.isBlank()) {
+            MeshVpnService.localPublicKey = getOrCreatePublicKey()
+        }
         val list = connectedPeers.filter { !it.quarantined && it.online }.map {
             val peerPk = prefs.getString("peer_pk_${it.virtualIp}", "") ?: ""
             MeshVpnService.PeerEndpointInfo(it.virtualIp, it.name, it.endpoint, it.lanEndpoint, peerPk)
@@ -5751,6 +5754,7 @@ class MainActivity : AppCompatActivity() {
         val lanEp = uri.getQueryParameter("lan") ?: ""
         val peerPublicKey = uri.getQueryParameter("pk") ?: ""
         val lansRaw = uri.getQueryParameter("lans") ?: ""
+        val relayParam = uri.getQueryParameter("relay")?.trim() ?: ""
         val require2fa = uri.getQueryParameter("auth2fa") == "1"
         val expectedPin = uri.getQueryParameter("pin") ?: ""
 
@@ -5807,6 +5811,11 @@ class MainActivity : AppCompatActivity() {
                     .putString("peer_pk_$peerHostIp", peerPublicKey)
                     .apply()
             }
+            if (relayParam.isNotBlank()) {
+                getSharedPreferences("nexomesh_prefs", MODE_PRIVATE).edit()
+                    .putString("relay_url", relayParam)
+                    .apply()
+            }
             MeshVpnService.updateLocalVirtualIp(myVirtualIp)
 
             val existing = connectedPeers.firstOrNull { it.virtualIp == peerHostIp }
@@ -5836,6 +5845,9 @@ class MainActivity : AppCompatActivity() {
             syncPeersToVpnService()
             appendLog("INFO", "Noise", peerHostIp, "Enlazado a '$peerName' ($peerHostIp) · Tu IP local asignada: $myVirtualIp (${lanEp.ifBlank { endpoint }})")
             if (vpnRunning) {
+                if (relayParam.isNotBlank()) {
+                    startMeshTunnel()
+                }
                 sendHello()
                 mainHandler.postDelayed({ sendHello() }, 1500L)
             } else {
@@ -6055,6 +6067,8 @@ class MainActivity : AppCompatActivity() {
             putExtra("MTU", activeMtu)
             putExtra("KEEPALIVE_SEC", activeKeepalive)
             putExtra("STUN_SERVER", activeStunServer)
+            val relayUrl = getSharedPreferences("nexomesh_prefs", MODE_PRIVATE).getString("relay_url", "") ?: ""
+            if (relayUrl.isNotBlank()) putExtra("RELAY_URL", relayUrl)
         }
         ContextCompat.startForegroundService(this, intent)
         vpnRunning = true

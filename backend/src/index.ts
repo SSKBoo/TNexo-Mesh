@@ -1,6 +1,6 @@
 import express from "express";
 import { createServer } from "http";
-import { createSignalingServer } from "./signaling.ts";
+import { attachSignalingToHttpServer, createSignalingServer, SignalingHub } from "./signaling.ts";
 import { createTurnRouter } from "./turn.ts";
 import { createPushRouter } from "./push.ts";
 import { createInvitesRouter } from "./invites.ts";
@@ -20,16 +20,20 @@ export function createApp() {
 export function start(port: number = 8080, signalingPort: number = 8443): void {
   const app = createApp();
   const server = createServer(app);
-  server.listen(port, () => console.log(`HTTP listening on ${port}`));
-  try {
-    createSignalingServer(
-      signalingPort,
-      process.env.SIGNALING_REQUIRE_SIGNATURE !== "0",
-      (from) => getStore().isAuthorizedSigningKey(from)
-    );
-    console.log(`Signaling listening on ${signalingPort}`);
-  } catch (e) {
-    console.error("signaling failed", e);
+  const requireSig = process.env.SIGNALING_REQUIRE_SIGNATURE !== "0";
+  const isAuthorized = (from: string) => getStore().isAuthorizedSigningKey(from);
+  const hub = new SignalingHub();
+
+  attachSignalingToHttpServer(server, requireSig, isAuthorized, hub, "/ws");
+  server.listen(port, () => console.log(`HTTP + WS(/ws) listening on ${port}`));
+
+  if (signalingPort !== port) {
+    try {
+      createSignalingServer(signalingPort, requireSig, isAuthorized, hub);
+      console.log(`Signaling listening on ${signalingPort}`);
+    } catch (e) {
+      console.error("signaling failed", e);
+    }
   }
 }
 

@@ -1,4 +1,5 @@
 import { WebSocket, WebSocketServer } from "ws";
+import type { Server as HttpServer } from "node:http";
 import crypto from "node:crypto";
 
 export interface SignalingSocket {
@@ -69,15 +70,37 @@ export class SignalingHub {
       case "heartbeat":
         rec.lastHeartbeat = Date.now();
         break;
+      case "list-peers": {
+        const peers = Array.from(this.peers.keys()).filter((pk) => pk !== from);
+        safeSend(rec.socket, JSON.stringify({ type: "peers", peers }));
+        break;
+      }
+      case "relay": {
+        const target = msg.to;
+        const out = JSON.stringify({ ...msg, from });
+        if (target) {
+          const targetRec = this.peers.get(target);
+          if (targetRec) {
+            // El payload es opaco (frame NM1 cifrado en base64). El backend nunca
+            // descifra: solo reenvía entre pares registrados (equivalente a DERP).
+            safeSend(targetRec.socket, out);
+          } else {
+            safeSend(rec.socket, JSON.stringify({ type: "error", payload: "peer not found" }));
+          }
+        } else {
+          // Sin `to` explícito (p.ej. RelayClient): reenviar a los demás pares.
+          for (const [pk, peerRec] of this.peers) {
+            if (pk !== from) safeSend(peerRec.socket, out);
+          }
+        }
+        break;
+      }
       case "offer":
       case "answer":
-      case "ice":
-      case "relay": {
+      case "ice": {
         const target = msg.to;
         const targetRec = target ? this.peers.get(target) : undefined;
         if (targetRec) {
-          // El payload es opaco (frame NM1 cifrado en base64). El backend nunca
-          // descifra: solo reenvía entre pares registrados (equivalente a DERP).
           safeSend(targetRec.socket, JSON.stringify({ ...msg, from }));
         } else {
           safeSend(rec.socket, JSON.stringify({ type: "error", payload: "peer not found" }));
@@ -115,21 +138,12 @@ function safeSend(socket: SignalingSocket | undefined, data: string): void {
   try { socket?.send(data); } catch {}
 }
 
-/**
- * Servidor de señalización con challenge-response:
- * 1. Al conectar envía { type: "challenge", nonce }.
- * 2. El cliente responde { type: "register", from, signature } where
- *    signature = Ed25519(nonce) con la privada asociada a `from`.
- * 3. Solo tras verificarlo se registra el par.
- * `requireSignature=false` mantiene compatibilidad con clientes legacy/tests.
- */
-export function createSignalingServer(
-  port: number,
-  requireSignature: boolean = true,
-  isAuthorized: (from: string) => boolean = () => true
+function bindSignalingWss(
+  wss: WebSocketServer,
+  hub: SignalingHub,
+  requireSignature: boolean,
+  isAuthorized: (from: string) => boolean
 ): WebSocketServer {
-  const wss = new WebSocketServer({ port });
-  const hub = new SignalingHub();
   const sweepTimer = setInterval(() => hub.sweep(), 60000);
   wss.on("connection", (ws) => {
     let registered = false;
@@ -161,5 +175,50 @@ export function createSignalingServer(
     });
   });
   wss.on("close", () => clearInterval(sweepTimer));
+  return wss;
+}
+
+/**
+ * Servidor de señalización con challenge-response:
+ * 1. Al conectar envía { type: "challenge", nonce }.
+ * 2. El cliente responde { type: "register", from, signature } where
+ *    signature = Ed25519(nonce) con la privada asociada a `from`.
+ * 3. Solo tras verificarlo se registra el par.
+ * `requireSignature=false` mantiene compatibilidad con clientes legacy/tests.
+ */
+export function createSignalingServer(
+  port: number,
+  requireSignature: boolean = true,
+  isAuthorized: (from: string) => boolean = () => true,
+  hub: SignalingHub = new SignalingHub()
+): WebSocketServer {
+  const wss = new WebSocketServer({ port });
+  return bindSignalingWss(wss, hub, requireSignature, isAuthorized);
+}
+
+/**
+ * Adjunta el mismo hub de señalización/relay DERP sobre `/ws` en el servidor HTTP
+ * principal para funcionar detrás de un único puerto reenviado (Codespaces, Colab,
+ * cloudflared o reverse proxy).
+ */
+export function attachSignalingToHttpServer(
+  server: HttpServer,
+  requireSignature: boolean = true,
+  isAuthorized: (from: string) => boolean = () => true,
+  hub: SignalingHub = new SignalingHub(),
+  wsPath: string = "/ws"
+): WebSocketServer {
+  const wss = new WebSocketServer({ noServer: true });
+  bindSignalingWss(wss, hub, requireSignature, isAuthorized);
+  server.on("upgrade", (req, socket, head) => {
+    const reqPath = (req.url ?? "/").split("?")[0];
+    if (reqPath !== wsPath && reqPath !== "/") {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  });
   return wss;
 }
