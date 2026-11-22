@@ -293,6 +293,27 @@ class MeshVpnService : VpnService() {
         val tunOut = FileOutputStream(descriptor.fileDescriptor)
         val lockWrite = Any()
 
+            // Los frames que llegan por el relay WSS se descifran y se inyectan
+            // en el TUN exactamente igual que los recibidos por UDP directo.
+            RelayClient.onFrameReceived = { frame ->
+                try {
+                    if (frame.size >= 4 + 1) {
+                        val senderLen = frame[3].toInt() and 0xFF
+                        if (4 + senderLen < frame.size) {
+                            val senderVip = String(frame, 4, senderLen, Charsets.UTF_8)
+                            val packet = if (RustCoreBridge.isNativeReady()) {
+                                RustCoreBridge.openPacket(senderVip, frame.copyOfRange(4 + senderLen, frame.size))
+                            } else frame.copyOfRange(4 + senderLen, frame.size)
+                            if (packet.isNotEmpty() && ((packet[0].toInt() ushr 4) and 0x0F) == 4) {
+                                synchronized(lockWrite) { tunOut.write(packet, 0, packet.size) }
+                                addRxBytes(packet.size)
+                            }
+                        }
+                    }
+                } catch (_: Exception) {
+                }
+            }
+
         // 1. TUN -> UDP (:51820) encapsulador IPv4
         Thread {
             val buf = ByteArray(4096)
@@ -344,12 +365,18 @@ class MeshVpnService : VpnService() {
                     // Un solo destino: el socket aprendido de los paquetes reales del par.
                     // Enviar por LAN y STUN a la vez duplicaba paquetes y rompía el TCP.
                     val target = resolveBestPeerTarget(dstIp, localIp)
+                    var sent = false
                     if (target != null) {
                         try {
                             sock.send(DatagramPacket(frame, frame.size, target.address, target.port))
                             addTxBytes(len)
+                            sent = true
                         } catch (_: Exception) {
                         }
+                    }
+                    if (!sent && RelayClient.isConnected()) {
+                        // Fallback DERP: UDP directo no disponible -> relay WSS
+                        if (RelayClient.send(frame)) addTxBytes(len)
                     }
                 } catch (_: Exception) {
                     if (!forwardRunning) break
@@ -367,6 +394,14 @@ class MeshVpnService : VpnService() {
                     sock.receive(pkt)
                     val len = pkt.length
                     if (len < 8) continue
+                    // STUN Binding Request sobre el socket del túnel: responder con el
+                    // mismo puerto para que el mapped address sea el real.
+                    if (len >= 20 && rxBuf[0] == 0x00.toByte() && rxBuf[1] == 0x01.toByte() &&
+                        rxBuf[4] == 0x21.toByte() && rxBuf[5] == 0x12.toByte()) {
+                        System.arraycopy(rxBuf, 0, rxBufCompat, 0, len)
+                        respondStunOnTunnelSocket(pkt, sock, len)
+                        continue
+                    }
                     if (rxBuf[0] == 'N'.code.toByte() && rxBuf[1] == 'M'.code.toByte() && rxBuf[2] == '_'.code.toByte()) {
                         val msg = String(rxBuf, 0, len, Charsets.UTF_8)
                         if (msg.startsWith("NM_HELLO|") || msg.startsWith("NM_ACK|")) {
@@ -453,6 +488,31 @@ class MeshVpnService : VpnService() {
             }
         }.apply { name = "NexoMesh-Keepalive"; start() }
     }
+
+    /**
+     * Responde un STUN Binding Request usando el MISMO socket UDP :51820 del túnel,
+     * de modo que el puerto público descubierto coincide con el puerto real (evita
+     * el problema de NAT simétrico del socket efímero deMainActivity).
+     */
+    private fun respondStunOnTunnelSocket(pkt: DatagramPacket, sock: DatagramSocket, len: Int) {
+        if (len < 20 || rxBufCompat[0] != 0x00.toByte() || rxBufCompat[1] != 0x01.toByte()) return
+        if ((rxBufCompat[4].toInt() and 0xFF) != 0x21 || (rxBufCompat[5].toInt() and 0xFF) != 0x12) return
+        val resp = ByteArray(32)
+        resp[0] = 0x01; resp[1] = 0x01
+        resp[2] = 0x00; resp[3] = 0x0C
+        resp[4] = 0x21; resp[5] = 0x12; resp[6] = 0xA4.toByte(); resp[7] = 0x42
+        System.arraycopy(rxBufCompat, 8, resp, 8, 12)
+        resp[20] = 0x00; resp[21] = 0x20; resp[22] = 0x00; resp[23] = 0x08
+        resp[24] = 0x00; resp[25] = 0x01
+        val port = pkt.port xor 0x2112
+        resp[26] = (port ushr 8).toByte(); resp[27] = port.toByte()
+        val ip = pkt.address?.hostAddress?.split(".")?.map { it.toIntOrNull() ?: 0 } ?: return
+        resp[28] = (ip[0] xor 0x21).toByte(); resp[29] = (ip[1] xor 0x12).toByte()
+        resp[30] = (ip[2] xor 0xA4).toByte(); resp[31] = (ip[3] xor 0x42).toByte()
+        try { sock.send(DatagramPacket(resp, resp.size, pkt.address, pkt.port)) } catch (_: Exception) {}
+    }
+
+    private val rxBufCompat = ByteArray(4200)
 
     private fun resolvePeerTargets(dstVirtualIp: String): List<InetSocketAddress> {
         val list = mutableListOf<InetSocketAddress>()

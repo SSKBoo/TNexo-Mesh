@@ -47,6 +47,15 @@ export class SignalingHub {
   }
 
   private handleMessage(from: string, raw: any): void {
+    // Frame NM1 binario: primer byte 'N','M','1' y luego len(senderVip)|vip|ciphertext.
+    // Lo reenviamos a TODOS los pares salvo el emisor (DERP-like), sin descifrar.
+    if (Buffer.isBuffer(raw) && raw.length >= 6 && raw[0] === 0x4e && raw[1] === 0x4d && raw[2] === 0x31) {
+      const frame = { type: "relay", from, data: raw.toString("base64") };
+      for (const [pk, rec] of this.peers) {
+        if (pk !== from) safeSend(rec.socket, JSON.stringify(frame));
+      }
+      return;
+    }
     let msg: any;
     try {
       msg = JSON.parse(String(raw));
@@ -62,10 +71,13 @@ export class SignalingHub {
         break;
       case "offer":
       case "answer":
-      case "ice": {
+      case "ice":
+      case "relay": {
         const target = msg.to;
         const targetRec = target ? this.peers.get(target) : undefined;
         if (targetRec) {
+          // El payload es opaco (frame NM1 cifrado en base64). El backend nunca
+          // descifra: solo reenvía entre pares registrados (equivalente a DERP).
           safeSend(targetRec.socket, JSON.stringify({ ...msg, from }));
         } else {
           safeSend(rec.socket, JSON.stringify({ type: "error", payload: "peer not found" }));

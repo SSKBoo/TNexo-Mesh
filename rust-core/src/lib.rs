@@ -2,6 +2,7 @@ pub mod crypto;
 pub mod keys;
 pub mod noise;
 pub mod session;
+pub mod derp;
 pub mod tunnel;
 pub mod routing;
 pub mod stun;

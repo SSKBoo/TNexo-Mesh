@@ -43,4 +43,5 @@ dependencies {
     implementation("com.wireguard.android:tunnel:1.0.20260102")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
