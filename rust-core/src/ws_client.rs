@@ -1,9 +1,9 @@
-//! Cliente WebSocket RFC 6455 mínimo (solo stdlib + rand_core) para conectar
-//! el nodo userspace Rust al relay DERP del backend sin dependencias nativas TLS.
+//! Cliente WebSocket RFC 6455 mínimo (ws:// y wss:// vía rustls en escritorio)
+//! para conectar el nodo userspace Rust al relay DERP del backend.
 
 use anyhow::{anyhow, Result};
 use rand_core::{OsRng, RngCore};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -14,30 +14,76 @@ pub enum WsFrame {
     Closed,
 }
 
+enum WsStream {
+    Plain(TcpStream),
+    #[cfg(not(target_os = "android"))]
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Read for WsStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            WsStream::Plain(s) => s.read(buf),
+            #[cfg(not(target_os = "android"))]
+            WsStream::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for WsStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            WsStream::Plain(s) => s.write(buf),
+            #[cfg(not(target_os = "android"))]
+            WsStream::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            WsStream::Plain(s) => s.flush(),
+            #[cfg(not(target_os = "android"))]
+            WsStream::Tls(s) => s.flush(),
+        }
+    }
+}
+
 pub struct WsClient {
-    stream: TcpStream,
+    stream: WsStream,
     buffered: Vec<u8>,
 }
 
 impl WsClient {
-    /// Conecta a un endpoint `ws://host:port/path`.
+    /// Conecta a un endpoint `ws://host:port/path` o `wss://host[:port]/path`.
     pub fn connect(url: &str) -> Result<Self> {
-        let rest = url
-            .strip_prefix("ws://")
-            .ok_or_else(|| anyhow!("solo se soporta ws:// en este cliente: {url}"))?;
+        let (is_tls, rest) = if let Some(r) = url.strip_prefix("wss://") {
+            (true, r)
+        } else if let Some(r) = url.strip_prefix("ws://") {
+            (false, r)
+        } else {
+            return Err(anyhow!("esquema WebSocket no soportado (usa ws:// o wss://): {url}"));
+        };
+
         let (host_port, path) = match rest.find('/') {
             Some(idx) => (&rest[..idx], &rest[idx..]),
             None => (rest, "/"),
         };
-        let addr = if host_port.contains(':') {
-            host_port.to_string()
+        let default_port = if is_tls { 443 } else { 80 };
+        let (host, addr) = if let Some((h, _p)) = host_port.rsplit_once(':') {
+            (h.to_string(), host_port.to_string())
         } else {
-            format!("{host_port}:80")
+            (host_port.to_string(), format!("{host_port}:{default_port}"))
         };
 
-        let mut stream = TcpStream::connect(&addr)?;
-        stream.set_read_timeout(Some(Duration::from_millis(50)))?;
-        stream.set_nodelay(true)?;
+        let tcp = TcpStream::connect(&addr)?;
+        tcp.set_read_timeout(Some(Duration::from_millis(50)))?;
+        tcp.set_nodelay(true)?;
+
+        let mut stream = if is_tls {
+            connect_tls(tcp, &host)?
+        } else {
+            WsStream::Plain(tcp)
+        };
 
         let mut key_bytes = [0u8; 16];
         OsRng.fill_bytes(&mut key_bytes);
@@ -54,22 +100,34 @@ impl WsClient {
         stream.write_all(req.as_bytes())?;
         stream.flush()?;
 
-        // Leer cabecera HTTP hasta \r\n\r\n preservando cualquier byte de trama ya llegado.
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut status_line = String::new();
-        reader.read_line(&mut status_line)?;
-        if !status_line.contains("101") {
-            return Err(anyhow!("handshake WebSocket rechazado: {}", status_line.trim()));
-        }
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            if line == "\r\n" || line.is_empty() {
-                break;
+        // Leer cabecera HTTP hasta \r\n\r\n preservando bytes sobrantes en `buffered`.
+        let mut hdr_buf = Vec::with_capacity(512);
+        let mut byte = [0u8; 1];
+        let mut header_end = None;
+        for _ in 0..8192 {
+            match stream.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => {
+                    hdr_buf.push(byte[0]);
+                    if hdr_buf.ends_with(b"\r\n\r\n") {
+                        header_end = Some(hdr_buf.len());
+                        break;
+                    }
+                }
+                Err(e) if is_timeout(&e) => continue,
+                Err(e) => return Err(e.into()),
             }
         }
-        let buffered = reader.buffer().to_vec();
-        Ok(Self { stream, buffered })
+        let end = header_end.ok_or_else(|| anyhow!("respuesta HTTP incompleta en handshake WS"))?;
+        let status_line = String::from_utf8_lossy(&hdr_buf[..end]);
+        let first_line = status_line.lines().next().unwrap_or("");
+        if !first_line.contains("101") {
+            return Err(anyhow!("handshake WebSocket rechazado: {}", first_line.trim()));
+        }
+        Ok(Self {
+            stream,
+            buffered: Vec::new(),
+        })
     }
 
     pub fn send_text(&mut self, text: &str) -> Result<()> {
@@ -142,11 +200,10 @@ impl WsClient {
         match opcode {
             0x8 => Ok(Some(WsFrame::Closed)),
             0x9 => {
-                // Ping -> Pong
                 let _ = self.send_raw(0xA, &payload);
                 Ok(None)
             }
-            0xA => Ok(None), // Pong
+            0xA => Ok(None),
             0x1 => Ok(Some(WsFrame::Text(String::from_utf8_lossy(&payload).into_owned()))),
             0x2 => Ok(Some(WsFrame::Binary(payload))),
             _ => Ok(None),
@@ -195,6 +252,29 @@ impl WsClient {
         }
         Ok(())
     }
+}
+
+#[cfg(not(target_os = "android"))]
+fn connect_tls(tcp: TcpStream, host: &str) -> Result<WsStream> {
+    use rustls::pki_types::ServerName;
+    use std::sync::Arc;
+
+    let root_store = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let server_name = ServerName::try_from(host.to_string())
+        .map_err(|_| anyhow!("nombre TLS inválido: {host}"))?;
+    let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|e| anyhow!("error iniciando TLS: {e}"))?;
+    Ok(WsStream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))))
+}
+
+#[cfg(target_os = "android")]
+fn connect_tls(_tcp: TcpStream, _host: &str) -> Result<WsStream> {
+    Err(anyhow!("wss:// en Android se gestiona vía RelayClient (OkHttp)"))
 }
 
 fn is_timeout(e: &std::io::Error) -> bool {

@@ -16,6 +16,10 @@ blake2 = "0.10"
 anyhow = "1"
 rand_core = { version = "0.6", features = ["getrandom"] }
 
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rustls = "0.23"
+webpki-roots = "0.26"
+
 [[bin]]
 name = "nexomesh-cli"
 path = "src/bin/nexomesh-cli.rs"

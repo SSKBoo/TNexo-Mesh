@@ -191,6 +191,7 @@ class MeshVpnService : VpnService() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var activeIp: String? = null
     private var activeMtu: Int = -1
+    private var serviceNetworkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile
     private var forwardRunning = false
 
@@ -265,6 +266,7 @@ class MeshVpnService : VpnService() {
         if (tunFd != null) {
             startForwardLoops(localIp, keepalive)
             ensureRelayConnected(intent, prefs, localIp)
+            registerNetworkMonitor()
             // El receptor :51821 vive en el servicio, no en la Activity: arranca
             // automaticamente con la VPN y sobrevive a recreaciones de pantalla.
             FileTransferCore.start(this)
@@ -641,6 +643,68 @@ class MeshVpnService : VpnService() {
         return resolvePeerTargets(dstVirtualIp).firstOrNull()
     }
 
+    private fun registerNetworkMonitor() {
+        if (serviceNetworkCallback != null) return
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val req = android.net.NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                onUnderlyingNetworkChanged()
+            }
+
+            override fun onLost(network: Network) {
+                onUnderlyingNetworkChanged()
+            }
+        }
+        try {
+            cm.registerNetworkCallback(req, cb)
+            serviceNetworkCallback = cb
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun unregisterNetworkMonitor() {
+        val cb = serviceNetworkCallback ?: return
+        serviceNetworkCallback = null
+        try {
+            getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun onUnderlyingNetworkChanged() {
+        if (!forwardRunning) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val nets = findUnderlyingPhysicalNetworks()
+                if (nets.isNotEmpty()) setUnderlyingNetworks(nets)
+            } catch (_: Exception) {
+            }
+        }
+        // Invalidar frescura UDP para caer de inmediato a Relay mientras Disco sondea la nueva red
+        lastDirectRxMs.clear()
+        Thread {
+            val prefs = getSharedPreferences("nexomesh_prefs", MODE_PRIVATE)
+            if (!RelayClient.isConnected()) {
+                ensureRelayConnected(null, prefs, localVirtualIp)
+            }
+            val sock = udpSocket ?: return@Thread
+            val hello = "NM_HELLO|$localVirtualIp|${Build.MODEL}|disco|$localPublicKey".toByteArray(Charsets.UTF_8)
+            for (peer in peerRoutes.values) {
+                for (target in resolvePeerTargets(peer.virtualIp)) {
+                    try {
+                        sock.send(DatagramPacket(hello, hello.size, target.address, target.port))
+                        recordHelloSent(peer.virtualIp)
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        }.start()
+    }
+
     private fun stopForwardLoops() {
         forwardRunning = false
         activeUdpSocket = null
@@ -688,6 +752,7 @@ class MeshVpnService : VpnService() {
     }
 
     private fun stopMesh() {
+        unregisterNetworkMonitor()
         stopForwardLoops()
         RelayClient.close()
         FileTransferCore.stop()
