@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod gui;
+#[cfg(target_os = "windows")]
+mod win_tun;
 
 #[derive(Clone, Copy)]
 enum TransportMode {

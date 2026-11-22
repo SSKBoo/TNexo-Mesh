@@ -7,6 +7,8 @@ use nexomesh_core::session;
 use nexomesh_core::ws_client::{
     base64_decode, base64_encode, extract_json_str, WsClient, WsFrame,
 };
+use qrcode::render::svg;
+use qrcode::QrCode;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -17,10 +19,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{handle_incoming_file_conn, probe_stun, send_bytes_p2p};
+#[cfg(target_os = "windows")]
+use crate::win_tun;
 
 struct GuiState {
     receiver_active: bool,
     tunnel_active: bool,
+    tun_adapter_active: bool,
     relay_connected: bool,
     direct_udp: bool,
     local_vip: String,
@@ -35,6 +40,8 @@ struct GuiState {
     outbound_packets: Vec<Vec<u8>>,
     ping_sent_at: Option<(u16, Instant)>,
     ping_seq: u16,
+    #[cfg(target_os = "windows")]
+    tun_session: Option<Arc<wintun::Session>>,
 }
 
 fn load_or_create_key(cfg_path: &Path) -> String {
@@ -79,6 +86,27 @@ fn open_folder_in_os(dir: &Path) {
     let _ = Command::new("xdg-open").arg(dir).spawn();
 }
 
+fn build_invite_uri(g: &GuiState) -> String {
+    let lan = detect_lan_ip();
+    let ep = if g.last_stun.contains(':') {
+        g.last_stun.clone()
+    } else {
+        format!("{lan}:51820")
+    };
+    let mut uri = format!(
+        "nexomesh://join?pk={}&ep={}&lan={}:51820&hostIp={}&ip=10.0.0.3&noise=IKpsk2&name=NexoMesh-PC&auth2fa=0",
+        url_encode(&g.local_key),
+        url_encode(&ep),
+        url_encode(&lan),
+        url_encode(&g.local_vip)
+    );
+    if !g.relay_url.is_empty() {
+        uri.push_str("&relay=");
+        uri.push_str(&url_encode(&g.relay_url));
+    }
+    uri
+}
+
 pub fn run_gui() {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let save_dir = cwd.join("NexoMesh_Recibidos");
@@ -88,6 +116,7 @@ pub fn run_gui() {
     let state = Arc::new(Mutex::new(GuiState {
         receiver_active: false,
         tunnel_active: false,
+        tun_adapter_active: false,
         relay_connected: false,
         direct_udp: false,
         local_vip: "10.0.0.2".to_string(),
@@ -102,6 +131,8 @@ pub fn run_gui() {
         outbound_packets: Vec::new(),
         ping_sent_at: None,
         ping_seq: 0,
+        #[cfg(target_os = "windows")]
+        tun_session: None,
     }));
 
     let listener = TcpListener::bind("127.0.0.1:51822")
@@ -154,6 +185,22 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<GuiState>>) {
         ("GET", "/") => {
             write_http(&mut stream, "200 OK", "text/html; charset=utf-8", HTML_UI.as_bytes());
         }
+        ("GET", "/api/qr.svg") => {
+            let uri = {
+                let g = state.lock().unwrap();
+                build_invite_uri(&g)
+            };
+            let svg_str = match QrCode::new(uri.as_bytes()) {
+                Ok(code) => code
+                    .render::<svg::Color>()
+                    .min_dimensions(220, 220)
+                    .dark_color(svg::Color("#0f172a"))
+                    .light_color(svg::Color("#ffffff"))
+                    .build(),
+                Err(_) => "<svg xmlns='http://www.w3.org/2000/svg'/>".to_string(),
+            };
+            write_http(&mut stream, "200 OK", "image/svg+xml; charset=utf-8", svg_str.as_bytes());
+        }
         ("GET", "/api/status") => {
             let lan = detect_lan_ip();
             let g = state.lock().unwrap();
@@ -166,7 +213,7 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<GuiState>>) {
                 .collect::<Vec<_>>()
                 .join(",");
             let json = format!(
-                "{{\"lanIp\":\"{}\",\"localVip\":\"{}\",\"peerVip\":\"{}\",\"localKey\":\"{}\",\"signingPub\":\"{}\",\"relayUrl\":\"{}\",\"peerEndpoint\":\"{}\",\"lastStun\":\"{}\",\"receiverActive\":{},\"tunnelActive\":{},\"relayConnected\":{},\"directUdp\":{},\"events\":[{}]}}",
+                "{{\"lanIp\":\"{}\",\"localVip\":\"{}\",\"peerVip\":\"{}\",\"localKey\":\"{}\",\"signingPub\":\"{}\",\"relayUrl\":\"{}\",\"peerEndpoint\":\"{}\",\"lastStun\":\"{}\",\"receiverActive\":{},\"tunnelActive\":{},\"tunAdapterActive\":{},\"relayConnected\":{},\"directUdp\":{},\"events\":[{}]}}",
                 escape_json(&lan),
                 escape_json(&g.local_vip),
                 escape_json(&g.peer_vip),
@@ -177,6 +224,7 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<GuiState>>) {
                 escape_json(&g.last_stun),
                 g.receiver_active,
                 g.tunnel_active,
+                g.tun_adapter_active,
                 g.relay_connected,
                 g.direct_udp,
                 events_json
@@ -255,10 +303,23 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<GuiState>>) {
             }
             write_http(&mut stream, "200 OK", "application/json", b"{\"ok\":true}");
         }
+        ("POST", "/api/tunnel/stop") => {
+            let mut g = state.lock().unwrap();
+            g.tunnel_active = false;
+            g.tun_adapter_active = false;
+            g.relay_connected = false;
+            g.direct_udp = false;
+            #[cfg(target_os = "windows")]
+            if let Some(sess) = g.tun_session.take() {
+                let _ = sess.shutdown();
+            }
+            g.events.insert(0, "⏹️ Túnel detenido".to_string());
+            write_http(&mut stream, "200 OK", "application/json", b"{\"ok\":true}");
+        }
         ("POST", "/api/ping") => {
             let mut g = state.lock().unwrap();
             if !g.tunnel_active {
-                write_http(&mut stream, "400 Bad Request", "application/json", b"{\"ok\":false,\"error\":\"Conecta primero el tunel\"}");
+                write_http(&mut stream, "400 Bad Request", "application/json", b"{\"ok\":false,\"error\":\"Enciende primero el tunel\"}");
                 return;
             }
             g.ping_seq = g.ping_seq.wrapping_add(1);
@@ -273,23 +334,7 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<GuiState>>) {
         }
         ("GET", "/api/invite") => {
             let g = state.lock().unwrap();
-            let lan = detect_lan_ip();
-            let ep = if g.last_stun.contains(':') {
-                g.last_stun.clone()
-            } else {
-                format!("{lan}:51820")
-            };
-            let mut uri = format!(
-                "nexomesh://join?pk={}&ep={}&lan={}:51820&hostIp={}&ip=10.0.0.3&noise=IKpsk2&name=NexoMesh-PC&auth2fa=0",
-                url_encode(&g.local_key),
-                url_encode(&ep),
-                url_encode(&lan),
-                url_encode(&g.local_vip)
-            );
-            if !g.relay_url.is_empty() {
-                uri.push_str("&relay=");
-                uri.push_str(&url_encode(&g.relay_url));
-            }
+            let uri = build_invite_uri(&g);
             let json = format!("{{\"uri\":\"{}\"}}", escape_json(&uri));
             write_http(&mut stream, "200 OK", "application/json", json.as_bytes());
         }
@@ -327,7 +372,6 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<GuiState>>) {
                     write_http(&mut stream, "200 OK", "application/json", json.as_bytes());
                 }
                 Err(lan_err) => {
-                    // Fallback tipo Tailscale: enviar cifrado dentro de frame NM1 por Relay/UDP
                     let mut g = state.lock().unwrap();
                     if g.tunnel_active && (g.relay_connected || g.direct_udp) {
                         let mut payload = format!("NM_F|{name}\n").into_bytes();
@@ -406,6 +450,39 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
         return;
     }
 
+    // Intentar levantar adaptador VPN real en Windows (Wintun) si existe wintun.dll y hay permisos Admin
+    #[cfg(target_os = "windows")]
+    let _wintun_guard = match win_tun::try_start_wintun(&local_vip) {
+        Ok(handle) => {
+            let sess = Arc::clone(&handle.session);
+            {
+                let mut g = state.lock().unwrap();
+                g.tun_adapter_active = true;
+                g.tun_session = Some(Arc::clone(&sess));
+                g.events.insert(0, format!("🛡️ Adaptador VPN Windows activo ({local_vip}/24)"));
+            }
+            let st_tun = Arc::clone(&state);
+            let sess_rx = Arc::clone(&sess);
+            let tun_local_vip = local_vip.clone();
+            thread::spawn(move || {
+                while let Ok(pkt) = sess_rx.receive_blocking() {
+                    let bytes = pkt.bytes();
+                    if bytes.len() >= 20 && (bytes[0] >> 4) == 4 {
+                        let dst = format!("{}.{}.{}.{}", bytes[16], bytes[17], bytes[18], bytes[19]);
+                        if dst.starts_with("10.0.0.") && dst != tun_local_vip {
+                            st_tun.lock().unwrap().outbound_packets.push(bytes.to_vec());
+                        }
+                    }
+                }
+            });
+            Some(handle)
+        }
+        Err(msg) => {
+            state.lock().unwrap().events.insert(0, format!("ℹ️ {msg}"));
+            None
+        }
+    };
+
     let mut node = match Node::bind(&local_vip, &peer_vip, 51820).or_else(|_| Node::bind(&local_vip, &peer_vip, 0)) {
         Ok(n) => n,
         Err(e) => {
@@ -479,7 +556,6 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
             }
         }
 
-        // Enviar paquetes encolados desde la GUI (Ping o archivos NM_F|)
         let pending: Vec<Vec<u8>> = {
             let mut g = state.lock().unwrap();
             std::mem::take(&mut g.outbound_packets)
@@ -565,7 +641,12 @@ fn handle_tunnel_payload(
         return;
     }
 
-    // ICMP Echo Reply
+    // Si el adaptador VPN Windows (Wintun) está activo, inyectar el paquete IPv4 al sistema operativo
+    #[cfg(target_os = "windows")]
+    if let Some(sess) = state.lock().unwrap().tun_session.as_ref().cloned() {
+        win_tun::write_ip_packet(&sess, packet);
+    }
+
     if packet.len() >= 28 && (packet[0] >> 4) == 4 && packet[9] == 1 {
         let ihl = ((packet[0] & 0x0F) as usize) * 4;
         if packet.len() >= ihl + 8 && packet[ihl] == 0 {
@@ -639,106 +720,189 @@ const HTML_UI: &str = r#"<!doctype html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>NexoMesh Desktop</title>
+<title>NexoMesh</title>
 <style>
-  body{margin:0;background:#0b1120;color:#f8fafc;font-family:system-ui,-apple-system,sans-serif;padding:20px}
-  .wrap{max-width:680px;margin:0 auto;display:grid;gap:14px}
-  .card{background:#111827;border:1px solid #1e293b;border-radius:16px;padding:16px}
-  h1{margin:0 0 8px;font-size:18px;display:flex;align-items:center;gap:8px}
-  .sub{color:#94a3b8;font-size:12px;margin-bottom:10px}
+  *{box-sizing:border-box}
+  body{margin:0;background:#0b1120;color:#f8fafc;font-family:system-ui,-apple-system,sans-serif;padding-bottom:76px}
+  .topbar{padding:14px 18px;border-bottom:1px solid #1e293b;display:flex;justify-content:space-between;align-items:center;background:#0f172a}
+  .brand{font-weight:700;font-size:17px;display:flex;align-items:center;gap:8px}
+  .pill{padding:4px 10px;border-radius:999px;font-size:11px;font-weight:600;background:#1e293b;color:#94a3b8}
+  .pill.ok{background:#064e3b;color:#34d399}
+  .wrap{max-width:540px;margin:16px auto;padding:0 14px;display:grid;gap:14px}
+  .card{background:#111827;border:1px solid #1e293b;border-radius:18px;padding:18px}
+  h2{margin:0 0 10px;font-size:16px;display:flex;align-items:center;gap:8px}
+  .sub{color:#94a3b8;font-size:12px;margin-bottom:12px}
   .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
-  input[type=text]{flex:1;min-width:160px;background:#0f172a;border:1px solid #334155;color:#f8fafc;padding:9px 11px;border-radius:10px;font-size:13px}
-  button{border:0;border-radius:10px;padding:9px 13px;font-weight:600;cursor:pointer;font-size:12px}
+  input[type=text]{flex:1;min-width:160px;background:#0f172a;border:1px solid #334155;color:#f8fafc;padding:10px 12px;border-radius:12px;font-size:13px}
+  button{border:0;border-radius:12px;padding:10px 14px;font-weight:600;cursor:pointer;font-size:13px}
   .primary{background:#059669;color:#fff}
+  .danger{background:#991b1b;color:#fecaca}
   .info{background:#0284c7;color:#fff}
   .ghost{background:#1e293b;color:#cbd5e1}
-  .log{background:#0f172a;border-radius:10px;padding:10px;font-size:12px;max-height:180px;overflow:auto;display:grid;gap:5px}
-  .badge{display:inline-block;background:#064e3b;color:#34d399;padding:3px 9px;border-radius:999px;font-size:11px}
-  .warn{background:#1e293b;color:#fbbf24}
-  code{background:#0f172a;padding:3px 6px;border-radius:6px;font-size:11px;word-break:break-all;display:block;margin-top:6px;color:#7dd3fc}
+  .qrbox{background:#fff;border-radius:14px;padding:12px;width:fit-content;margin:10px auto}
+  .log{background:#0f172a;border-radius:12px;padding:12px;font-size:12px;max-height:280px;overflow:auto;display:grid;gap:6px}
+  .tab{display:none}.tab.active{display:grid;gap:14px}
+  .nav{position:fixed;bottom:0;left:0;right:0;background:#0f172a;border-top:1px solid #1e293b;display:flex;justify-content:space-around;padding:8px 4px}
+  .nav button{background:transparent;color:#94a3b8;display:flex;flex-direction:column;align-items:center;gap:2px;font-size:11px;padding:6px 10px}
+  .nav button.active{color:#34d399}
+  .nav span{font-size:18px}
+  code{background:#0f172a;padding:6px 8px;border-radius:8px;font-size:11px;word-break:break-all;display:block;color:#7dd3fc;margin-top:8px}
 </style>
 </head>
 <body>
+<div class="topbar">
+  <div class="brand">🛡️ NexoMesh PC</div>
+  <div class="pill" id="topStatus">Desconectado</div>
+</div>
+
 <div class="wrap">
-  <div class="card">
-    <h1>🛡️ NexoMesh PC</h1>
-    <div class="sub" id="ipInfo">🌐 Cargando...</div>
-    <div class="row">
-      <button class="primary" id="rxBtn" onclick="startRx()">📥 Receptor (:51821)</button>
-      <button class="info" onclick="openFolder()">📂 Descargas</button>
-      <button class="ghost" onclick="testStun()">🌐 STUN</button>
-      <button class="ghost" onclick="genInvite()">🔗 Invitación</button>
-    </div>
-    <code id="inviteOut" style="display:none"></code>
-  </div>
-
-  <div class="card">
-    <h1>🌍 Conexión Remota (Fuera de LAN)</h1>
-    <div class="row">
-      <input type="text" id="joinUri" placeholder="Pegar enlace nexomesh://join?... del celular"/>
-      <button class="ghost" onclick="applyJoin()">📲 Cargar</button>
-    </div>
-    <div class="row">
-      <input type="text" id="relayUrl" placeholder="Relay DERP (ej. ws://tu-servidor:8080/ws)"/>
-      <input type="text" id="peerVip" placeholder="IP Par (10.0.0.1)" style="max-width:120px"/>
-    </div>
-    <div class="row">
-      <button class="primary" id="tunBtn" onclick="startTunnel()">🔌 Conectar Túnel + Relay</button>
-      <button class="info" onclick="sendPing()">📡 Ping P2P</button>
+  <div class="tab active" id="tab-tunnel">
+    <div class="card">
+      <h2>🛡️ Túnel P2P</h2>
+      <div class="sub" id="tunnelMeta">🌐 LAN: ... · VPN: 10.0.0.2/24</div>
+      <div class="row">
+        <button class="primary" style="flex:1" id="tunBtn" onclick="toggleTunnel()">🔌 Conectar Túnel</button>
+        <button class="info" onclick="sendPing()">📡 Ping</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <span class="pill" id="vpnModePill">Userspace</span>
+        <span class="pill" id="relayPill">Sin Relay</span>
+        <span class="pill" id="udpPill">Sin UDP</span>
+      </div>
     </div>
   </div>
 
-  <div class="card">
-    <h1>📤 Enviar Archivo (LAN o Remoto)</h1>
-    <div class="row">
-      <input type="text" id="targetIp" placeholder="IP destino (ej. 10.0.0.1 o 192.168.1.45)"/>
-      <input type="file" id="filePick" style="color:#cbd5e1;font-size:12px"/>
+  <div class="tab" id="tab-connect">
+    <div class="card" style="text-align:center">
+      <h2>📲 Escanear QR desde Celular</h2>
+      <div class="qrbox"><img id="qrImg" src="/api/qr.svg" width="210" height="210" alt="QR NexoMesh"/></div>
+      <div class="row" style="justify-content:center">
+        <button class="ghost" onclick="copyInvite()">📋 Copiar enlace</button>
+        <button class="ghost" onclick="refreshQr()">🔄 Actualizar QR</button>
+      </div>
+      <code id="inviteOut" style="display:none"></code>
     </div>
-    <button class="primary" style="width:100%" onclick="sendFile()">🚀 Enviar Archivo</button>
+    <div class="card">
+      <h2>🔗 Pegar invitación del celular</h2>
+      <div class="row">
+        <input type="text" id="joinUri" placeholder="nexomesh://join?..."/>
+        <button class="primary" onclick="applyJoin()">Conectar</button>
+      </div>
+    </div>
   </div>
 
-  <div class="card">
-    <h1>📋 Actividad</h1>
-    <div class="log" id="logs"></div>
+  <div class="tab" id="tab-files">
+    <div class="card">
+      <h2>📥 Recibir (:51821)</h2>
+      <div class="row">
+        <button class="primary" style="flex:1" id="rxBtn" onclick="startRx()">📥 Activar Receptor</button>
+        <button class="info" onclick="openFolder()">📂 Descargas</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>📤 Enviar Archivo</h2>
+      <div class="row">
+        <input type="text" id="targetIp" placeholder="IP destino (10.0.0.1 o LAN)"/>
+        <input type="file" id="filePick" style="color:#cbd5e1;font-size:12px"/>
+      </div>
+      <button class="primary" style="width:100%" onclick="sendFile()">🚀 Enviar</button>
+    </div>
+  </div>
+
+  <div class="tab" id="tab-activity">
+    <div class="card">
+      <h2>📋 Actividad</h2>
+      <div class="log" id="logs"></div>
+    </div>
+  </div>
+
+  <div class="tab" id="tab-settings">
+    <div class="card">
+      <h2>⚙️ Red y Relay DERP</h2>
+      <div class="sub">Para que Windows cree la tarjeta VPN 10.0.0.0/24 del sistema, coloca <b>wintun.dll</b> junto al ejecutable y ábrelo como Administrador.</div>
+      <div class="row"><input type="text" id="relayUrl" placeholder="Relay DERP (ws://tu-servidor:8080/ws)"/></div>
+      <div class="row">
+        <input type="text" id="localVip" placeholder="IP PC (10.0.0.2)"/>
+        <input type="text" id="peerVip" placeholder="IP Par (10.0.0.1)"/>
+      </div>
+      <div class="row">
+        <button class="primary" style="flex:1" onclick="saveAndConnect()">💾 Guardar y Conectar</button>
+        <button class="ghost" onclick="testStun()">🌐 STUN</button>
+      </div>
+    </div>
   </div>
 </div>
+
+<div class="nav">
+  <button class="active" onclick="go('tunnel',this)"><span>🛡️</span>Túnel</button>
+  <button onclick="go('connect',this)"><span>🔗</span>Conectar</button>
+  <button onclick="go('files',this)"><span>📁</span>Archivos</button>
+  <button onclick="go('activity',this)"><span>📋</span>Actividad</button>
+  <button onclick="go('settings',this)"><span>⚙️</span>Ajustes</button>
+</div>
+
 <script>
-let initDone = false;
+let initDone = false, tunActive = false;
+function go(name, btn){
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.nav button').forEach(b=>b.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  btn.classList.add('active');
+  if(name==='connect') refreshQr();
+}
 async function refresh(){
   const r = await fetch('/api/status'); const d = await r.json();
-  const rel = d.relayConnected ? '<span class="badge">Relay OK</span>' : '<span class="badge warn">Sin Relay</span>';
-  const udp = d.directUdp ? '<span class="badge">UDP Directo</span>' : '';
-  document.getElementById('ipInfo').innerHTML = `🌐 LAN: <span class="badge">${d.lanIp}:51821</span> · VPN: <span class="badge">${d.localVip}</span> ${rel} ${udp}`;
-  document.getElementById('rxBtn').textContent = d.receiverActive ? '✅ Receptor Activo' : '📥 Receptor (:51821)';
-  document.getElementById('tunBtn').textContent = d.tunnelActive ? '✅ Túnel Activo' : '🔌 Conectar Túnel + Relay';
+  tunActive = d.tunnelActive;
+  const top = document.getElementById('topStatus');
+  top.textContent = d.tunnelActive ? 'Conectado' : 'Desconectado';
+  top.className = 'pill ' + (d.tunnelActive ? 'ok' : '');
+  document.getElementById('tunnelMeta').textContent = `🌐 LAN: ${d.lanIp}:51821 · VPN: ${d.localVip}/24`;
+  const tb = document.getElementById('tunBtn');
+  tb.textContent = d.tunnelActive ? '⏹️ Detener Túnel' : '🔌 Conectar Túnel';
+  tb.className = d.tunnelActive ? 'danger' : 'primary';
+  document.getElementById('vpnModePill').textContent = d.tunAdapterActive ? 'VPN Sistema (Wintun)' : 'Modo Userspace';
+  document.getElementById('vpnModePill').className = 'pill ' + (d.tunAdapterActive ? 'ok' : '');
+  document.getElementById('relayPill').textContent = d.relayConnected ? 'Relay OK' : 'Sin Relay';
+  document.getElementById('relayPill').className = 'pill ' + (d.relayConnected ? 'ok' : '');
+  document.getElementById('udpPill').textContent = d.directUdp ? 'UDP Directo' : 'Sin UDP';
+  document.getElementById('udpPill').className = 'pill ' + (d.directUdp ? 'ok' : '');
+  document.getElementById('rxBtn').textContent = d.receiverActive ? '✅ Receptor Activo' : '📥 Activar Receptor';
   if(!initDone){
-    if(d.relayUrl) document.getElementById('relayUrl').value = d.relayUrl;
-    if(d.peerVip) document.getElementById('peerVip').value = d.peerVip;
+    document.getElementById('relayUrl').value = d.relayUrl || '';
+    document.getElementById('localVip').value = d.localVip || '10.0.0.2';
+    document.getElementById('peerVip').value = d.peerVip || '10.0.0.1';
     initDone = true;
   }
   document.getElementById('logs').innerHTML = d.events.map(e=>`<div>${e}</div>`).join('') || '<div>📭 Sin eventos</div>';
 }
-async function startRx(){ await fetch('/api/receiver/start',{method:'POST'}); refresh(); }
-async function openFolder(){ await fetch('/api/open-folder',{method:'POST'}); }
-async function testStun(){ await fetch('/api/stun'); refresh(); }
+function refreshQr(){ document.getElementById('qrImg').src = '/api/qr.svg?t=' + Date.now(); }
+async function copyInvite(){
+  const r = await fetch('/api/invite'); const d = await r.json();
+  const el = document.getElementById('inviteOut'); el.style.display='block'; el.textContent=d.uri;
+  try{ await navigator.clipboard.writeText(d.uri); }catch{}
+}
+async function toggleTunnel(){
+  if(tunActive){ await fetch('/api/tunnel/stop',{method:'POST'}); }
+  else { await saveAndConnect(); }
+  refresh();
+}
+async function saveAndConnect(){
+  const relayUrl = document.getElementById('relayUrl').value.trim();
+  const localVip = document.getElementById('localVip').value.trim();
+  const peerVip = document.getElementById('peerVip').value.trim();
+  await fetch('/api/tunnel/start',{method:'POST',body:JSON.stringify({relayUrl,localVip,peerVip})});
+  refresh();
+}
 async function applyJoin(){
   const u = document.getElementById('joinUri').value.trim();
   if(!u) return;
   await fetch('/api/join',{method:'POST',body:u});
-  initDone = false; refresh();
+  initDone = false; await saveAndConnect(); refresh();
 }
-async function startTunnel(){
-  const relayUrl = document.getElementById('relayUrl').value.trim();
-  const peerVip = document.getElementById('peerVip').value.trim();
-  await fetch('/api/tunnel/start',{method:'POST',body:JSON.stringify({relayUrl,peerVip})});
-  refresh();
-}
+async function startRx(){ await fetch('/api/receiver/start',{method:'POST'}); refresh(); }
+async function openFolder(){ await fetch('/api/open-folder',{method:'POST'}); }
+async function testStun(){ await fetch('/api/stun'); refresh(); }
 async function sendPing(){ await fetch('/api/ping',{method:'POST'}); refresh(); }
-async function genInvite(){
-  const r = await fetch('/api/invite'); const d = await r.json();
-  const el = document.getElementById('inviteOut');
-  el.style.display = 'block'; el.textContent = d.uri;
-}
 async function sendFile(){
   const to = document.getElementById('targetIp').value.trim();
   const f = document.getElementById('filePick').files[0];

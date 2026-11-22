@@ -6,3 +6,7 @@ edition = "2021"
 [dependencies]
 nexomesh_core = { path = "../rust-core" }
 snow = "0.10"
+qrcode = "0.14"
+
+[target.'cfg(windows)'.dependencies]
+wintun = "0.5"
