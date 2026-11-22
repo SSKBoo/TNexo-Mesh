@@ -46,6 +46,12 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
+      - name: Cachear debug.keystore para permitir actualizaciones sin desinstalar
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: nexomesh-debug-keystore-v1
+
       - name: Compilar APK Debug
         run: gradle assembleDebug --no-daemon
 

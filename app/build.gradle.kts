@@ -11,8 +11,9 @@ android {
         applicationId = "io.nexomesh.vpn"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1.0"
+        val ciRun = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0
+        versionCode = 10 + ciRun
+        versionName = "1.1.$ciRun"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
