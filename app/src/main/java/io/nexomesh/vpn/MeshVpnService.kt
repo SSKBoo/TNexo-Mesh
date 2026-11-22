@@ -142,7 +142,7 @@ class MeshVpnService : VpnService() {
 
         fun sendHelloBurstToPeer(lanEndpoint: String, stunEndpoint: String, myIp: String, myName: String) {
             val sock = activeUdpSocket ?: return
-            val helloBytes = "NM_HELLO|$myIp|$myName|$lanEndpoint".toByteArray(Charsets.UTF_8)
+            val helloBytes = "NM_HELLO|$myIp|$myName|$lanEndpoint|$localPublicKey".toByteArray(Charsets.UTF_8)
             val targets = listOf(lanEndpoint, stunEndpoint)
                 .flatMap { raw -> raw.split(",").map { it.trim() } }
             for (raw in targets) {
@@ -460,18 +460,35 @@ class MeshVpnService : VpnService() {
                             val parts = msg.split("|")
                             val peerVip = parts.getOrNull(1)?.trim() ?: ""
                             val peerName = parts.getOrNull(2)?.trim() ?: "Par P2P"
+                            val peerPk = parts.getOrNull(4)?.trim() ?: ""
                             val senderIp = pkt.address?.hostAddress ?: ""
                             if (peerVip.startsWith("10.0.0.") && peerVip != localIp && senderIp.isNotEmpty()) {
                                 val remote = InetSocketAddress(pkt.address, pkt.port)
                                 learnedSocketAddrs[peerVip] = remote
                                 lastDirectRxMs[peerVip] = System.currentTimeMillis()
+                                if (peerPk.isNotBlank()) {
+                                    getSharedPreferences("nexomesh_prefs", MODE_PRIVATE).edit()
+                                        .putString("peer_pk_$peerVip", peerPk)
+                                        .apply()
+                                    val existing = peerRoutes[peerVip]
+                                    peerRoutes[peerVip] = PeerEndpointInfo(
+                                        virtualIp = peerVip,
+                                        name = existing?.name ?: peerName,
+                                        stunEndpoint = existing?.stunEndpoint ?: "$senderIp:${pkt.port}",
+                                        lanEndpoint = existing?.lanEndpoint ?: "$senderIp:${pkt.port}",
+                                        peerPublicKey = peerPk
+                                    )
+                                    if (RustCoreBridge.isNativeReady() && localPublicKey.isNotBlank()) {
+                                        RustCoreBridge.initSession(peerVip, localPublicKey, peerPk)
+                                    }
+                                }
                                 peerDiscoveredListener?.invoke(peerVip, peerName, "$senderIp:${pkt.port}")
                                 if (msg.startsWith("NM_ACK|")) {
                                     // ACK recibido: medimos RTT real desde el HELLO enviado a este par
                                     recordAckReceived(peerVip)
                                 }
                                 if (msg.startsWith("NM_HELLO|")) {
-                                    val ack = "NM_ACK|$localIp|${Build.MODEL}|direct".toByteArray(Charsets.UTF_8)
+                                    val ack = "NM_ACK|$localIp|${Build.MODEL}|direct|$localPublicKey".toByteArray(Charsets.UTF_8)
                                     try {
                                         sock.send(DatagramPacket(ack, ack.size, pkt.address, pkt.port))
                                     } catch (_: Exception) {
@@ -523,7 +540,7 @@ class MeshVpnService : VpnService() {
                 try {
                     val sock = udpSocket
                     if (sock != null) {
-                        val hello = "NM_HELLO|$localIp|${Build.MODEL}|keepalive".toByteArray(Charsets.UTF_8)
+                        val hello = "NM_HELLO|$localIp|${Build.MODEL}|keepalive|$localPublicKey".toByteArray(Charsets.UTF_8)
                         for (peer in peerRoutes.values) {
                             for (target in resolvePeerTargets(peer.virtualIp)) {
                                 try {

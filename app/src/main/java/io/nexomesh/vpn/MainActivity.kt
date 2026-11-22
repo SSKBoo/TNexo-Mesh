@@ -1395,7 +1395,7 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.parseColor("#F8FAFC"))
         }
         val fsSub = TextView(this).apply {
-            text = "Elige varios archivos y carpetas a la vez y envíalos por 10.0.0.0/24 o LAN directo (:51821)."
+            text = "🔒 10.0.0.0/24 · TCP :51821"
             textSize = 11f
             setTextColor(Color.parseColor("#94A3B8"))
             setPadding(0, dp(4), 0, dp(10))
@@ -1629,18 +1629,35 @@ class MainActivity : AppCompatActivity() {
         }
         themedSurfaceCards.add(queueCard)
 
+        val qHeaderRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(4))
+        }
         val qTitle = TextView(this).apply {
-            text = "Historial y Cola de Archivos"
+            text = "📁 Cola de Archivos"
             textSize = 15f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#F8FAFC"))
-            setPadding(0, 0, 0, dp(4))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
+        val clearTransfersBtn = makeStyledButton("🗑️ Limpiar", themeInset(), "#334155", "#94A3B8", 10).apply {
+            textSize = 11f
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            minHeight = dp(32)
+            setOnClickListener {
+                fileTransfersList.clear()
+                persistState()
+                refreshAllUi()
+            }
+        }
+        qHeaderRow.addView(qTitle)
+        qHeaderRow.addView(clearTransfersBtn)
         val liquidLegend = TextView(this).apply {
-            text = "💧 Verde: Llenando/OK · ❄️ Azul: Congelado/Deshielo · 💔 Rojo: Fallo · ⭕ Gris: Vacío"
+            text = "💧 OK  ·  ❄️ Pausa  ·  💔 Error  ·  ⭕ Cancelado"
             textSize = 10f
             setTextColor(Color.parseColor("#94A3B8"))
-            setPadding(0, 0, 0, dp(10))
+            setPadding(0, 0, 0, dp(8))
         }
 
         val filterScroll = HorizontalScrollView(this).apply {
@@ -1683,7 +1700,7 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
         }
 
-        queueCard.addView(qTitle)
+        queueCard.addView(qHeaderRow)
         queueCard.addView(liquidLegend)
         queueCard.addView(filterScroll)
         queueCard.addView(fileTransfersContainer)
@@ -2334,9 +2351,13 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(4); rightMargin = dp(4) }
             setOnClickListener { exportLogsToJson() }
         }
-        val clearBtn = makeStyledButton("Limpiar", themeInset(), "#334155", "#94A3B8").apply {
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.8f).apply { leftMargin = dp(4) }
-            setOnClickListener { logsList.clear(); refreshAllUi() }
+        val clearBtn = makeStyledButton("🗑️", themeInset(), "#334155", "#94A3B8").apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.5f).apply { leftMargin = dp(4) }
+            setOnClickListener {
+                logsList.clear()
+                persistState()
+                refreshAllUi()
+            }
         }
         exportRow.addView(exportCsvBtn)
         exportRow.addView(exportJsonBtn)
@@ -2753,38 +2774,7 @@ class MainActivity : AppCompatActivity() {
         col.addView(deviceCard)
         col.addView(guideCard)
 
-        // Herramientas de depuración: pruebas de intrusión y simulación de caída
-        // Movidas aquí desde Guardián/Túnel para evitar pulsaciones accidentales.
-        val debugCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = makeCardDrawable(themeSurface(), themeBorder(), 18, 1)
-            setPadding(dp(18), dp(18), dp(18), dp(18))
-        }
-        val debugTitle = TextView(this).apply {
-            text = "Herramientas de depuración"
-            textSize = 14f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.parseColor("#F8FAFC"))
-            setPadding(0, 0, 0, dp(10))
-        }
-        debugCard.addView(debugTitle)
-        val debugRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val debugLossBtn = makeStyledButton("Simular caída", "#2A1215", "#7F1D1D", "#FCA5A5", 10).apply {
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(3) }
-            setOnClickListener {
-                vpnRunning = true
-                triggerLossAndExponentialBackoff()
-                refreshAllUi()
-            }
-        }
-        val debugFloodBtn = makeStyledButton("Flood UDP", "#450A0A", "#EF4444", "#FCA5A5", 10).apply {
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(3) }
-            setOnClickListener { triggerDefenseAttackTest("Flood UDP") }
-        }
-        debugRow.addView(debugLossBtn)
-        debugRow.addView(debugFloodBtn)
-        debugCard.addView(debugRow)
-        col.addView(debugCard)
+        // Herramientas de depuración ocultas en producción
         scroll.addView(col)
         return scroll
     }
@@ -2807,16 +2797,16 @@ class MainActivity : AppCompatActivity() {
         }
         themedSurfaceCards.add(defenseCard)
         val defTitle = TextView(this).apply {
-            text = "Modo Guardián · Defensa Autónoma Mesh"
+            text = "🛡️ Guardián Mesh"
             textSize = 16f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#F8FAFC"))
         }
         val defSub = TextView(this).apply {
-            text = "Controla la protección contra ataques, cuarentena automática y rotación de llaves Curve25519."
+            text = "🔒 Curve25519 · Cuarentena automática"
             textSize = 11f
             setTextColor(Color.parseColor("#94A3B8"))
-            setPadding(0, dp(4), 0, dp(10))
+            setPadding(0, dp(2), 0, dp(10))
         }
 
         guardianPostureBanner = LinearLayout(this).apply {
@@ -2959,9 +2949,6 @@ class MainActivity : AppCompatActivity() {
         defenseCard.addView(policyRateLimitSwitch)
         defenseCard.addView(policyAutoBunkerSwitch)
         defenseCard.addView(policyStrictDnsSwitch)
-        defenseCard.addView(attackTitle)
-        defenseCard.addView(atkRow1)
-        defenseCard.addView(atkMitmBtn)
         defenseCard.addView(defenseQuarantineContainer)
 
         col.addView(defenseCard)
@@ -3623,7 +3610,7 @@ class MainActivity : AppCompatActivity() {
         fileTransfersContainer.removeAllViews()
         if (visibleTransfers.isEmpty()) {
             val emptyFiles = TextView(this).apply {
-                text = "Sin transferencias en esta categoría. Selecciona varios archivos/carpetas o activa el receptor (:51821)."
+                text = "📭 Sin transferencias"
                 textSize = 11f
                 setTextColor(Color.parseColor("#94A3B8"))
                 setPadding(dp(4), dp(8), dp(4), dp(8))
@@ -3646,13 +3633,13 @@ class MainActivity : AppCompatActivity() {
                 }
                 val circleView = LiquidCircleView(this).apply {
                     setTransferState(ft.progressPct, ft.status, ft.frostLevel, waveTick)
-                    layoutParams = LinearLayout.LayoutParams(dp(56), dp(56)).apply { rightMargin = dp(12) }
+                    layoutParams = LinearLayout.LayoutParams(dp(52), dp(52)).apply { rightMargin = dp(10) }
                 }
                 val ftCol = LinearLayout(this).apply {
                     orientation = LinearLayout.VERTICAL
                     layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 }
-                val arrow = if (ft.direction == "send") "↑" else "↓"
+                val arrow = if (ft.direction == "send") "📤" else "📥"
                 val ftName = TextView(this).apply {
                     text = "$arrow ${ft.fileName} (${formatBytes(ft.sizeBytes)})"
                     textSize = 13f
@@ -3660,22 +3647,38 @@ class MainActivity : AppCompatActivity() {
                     setTextColor(Color.parseColor("#F8FAFC"))
                 }
                 val statusLabel = when (ft.status) {
-                    "paused" -> "Pausado · Congelado"
-                    "thawing" -> "Reintentando · Deshielando (${100 - ft.frostLevel}%)"
-                    "failed" -> ft.errorReason ?: "Error de envío"
-                    "canceled" -> "Cancelado · Vacío"
-                    "completed" -> "Completado 100%"
-                    else -> "Transfiriendo ${ft.progressPct}%"
+                    "paused" -> "❄️ Pausado"
+                    "thawing" -> "💧 Reintentando"
+                    "failed" -> "💔 ${ft.errorReason ?: "Error"}"
+                    "canceled" -> "⭕ Cancelado"
+                    "completed" -> "✅ 100%"
+                    else -> "⏳ ${ft.progressPct}%"
                 }
                 val ftMeta = TextView(this).apply {
                     text = "${ft.peerIp} · ${ft.channel} · $statusLabel"
                     textSize = 11f
                     setTextColor(Color.parseColor("#94A3B8"))
                 }
+                val delBtn = makeStyledButton("🗑️", themeInset(), "#334155", "#FCA5A5", 10).apply {
+                    textSize = 13f
+                    setPadding(dp(8), dp(4), dp(8), dp(4))
+                    minWidth = dp(36)
+                    minHeight = dp(36)
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply { leftMargin = dp(6) }
+                    setOnClickListener {
+                        fileTransfersList.remove(ft)
+                        persistState()
+                        refreshAllUi()
+                    }
+                }
                 ftCol.addView(ftName)
                 ftCol.addView(ftMeta)
                 topRow.addView(circleView)
                 topRow.addView(ftCol)
+                topRow.addView(delBtn)
                 ftCard.addView(topRow)
 
                 val btnRow = LinearLayout(this).apply {
@@ -4647,9 +4650,11 @@ class MainActivity : AppCompatActivity() {
             mainHandler.post {
                 if (activeChannel == "LAN_BLUETOOTH") {
                     ftItem.channel = "Bluetooth (Respaldo)"
-                    ftItem.status = "completed"
-                    ftItem.progressPct = 100
-                    appendLog("INFO", "WireGuard", targetIp, "Red local sin respuesta; enviando '$fileName' vía Bluetooth de respaldo")
+                    ftItem.status = "failed"
+                    ftItem.progressPct = 0
+                    ftItem.errorReason = "Sin TCP :51821 · usar Bluetooth"
+                    appendLog("WARNING", "WireGuard", targetIp, "TCP :51821 sin respuesta; abriendo compartir Android para '$fileName'")
+                    persistState()
                     refreshAllUi()
                     launchBluetoothShareIntent(uri, fileName)
                     return@post
