@@ -53,3 +53,24 @@ pub fn sign_challenge_b64(seed_text: &str, nonce: &str) -> (String, String) {
         crate::ws_client::base64_encode(&sig.to_bytes()),
     )
 }
+
+/// Dual-Stack: deriva una IPv4 determinista en `10.0.0.0/24` y una IPv6 ULA
+/// en `fd7a:115c:a1e0::/48` a partir de la clave pública del nodo.
+pub fn dual_stack_ips_from_pubkey(pubkey: &str) -> (std::net::Ipv4Addr, std::net::Ipv6Addr) {
+    use blake2::{Blake2s256, Digest};
+    let mut h = Blake2s256::new();
+    h.update(b"nexomesh-dualstack-v1|");
+    h.update(pubkey.as_bytes());
+    let out = h.finalize();
+    let octet = (out[0] % 250).max(2);
+    let v4 = std::net::Ipv4Addr::new(10, 0, 0, octet);
+    let mut v6 = [0u8; 16];
+    v6[0] = 0xfd;
+    v6[1] = 0x7a;
+    v6[2] = 0x11;
+    v6[3] = 0x5c;
+    v6[4] = 0xa1;
+    v6[5] = 0xe0;
+    v6[6..16].copy_from_slice(&out[1..11]);
+    (v4, std::net::Ipv6Addr::from(v6))
+}

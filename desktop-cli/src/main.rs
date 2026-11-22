@@ -8,6 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod gui;
 #[cfg(target_os = "windows")]
 mod win_tun;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod unix_tun;
 
 #[derive(Clone, Copy)]
 enum TransportMode {
