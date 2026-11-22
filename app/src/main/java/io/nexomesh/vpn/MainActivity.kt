@@ -2607,6 +2607,43 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.parseColor("#94A3B8"))
         }
 
+        val relayLabel = TextView(this).apply {
+            text = "Relay DERP de respaldo (WSS/WS)"
+            textSize = 12f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#CBD5E1"))
+            setPadding(0, dp(12), 0, dp(6))
+        }
+        val savedRelay = getSharedPreferences("nexomesh_prefs", MODE_PRIVATE).getString("relay_url", "") ?: ""
+        val relayUrlInput = EditText(this).apply {
+            hint = "wss://tu-servidor/ws (o ws://10.0.2.2:8080/ws)"
+            setText(savedRelay)
+            textSize = 12f
+            setSingleLine(true)
+            setHintTextColor(Color.parseColor("#64748B"))
+            setTextColor(Color.parseColor("#F8FAFC"))
+            background = makeCardDrawable(themeInset(), themeBorder(), 10, 1)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+        }
+        val relaySaveBtn = makeStyledButton("Guardar y Conectar Relay", "#0284C7", "#38BDF8", "#FFFFFF").apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
+            setOnClickListener {
+                val url = relayUrlInput.text.toString().trim()
+                getSharedPreferences("nexomesh_prefs", MODE_PRIVATE).edit()
+                    .putString("relay_url", url)
+                    .apply()
+                RelayClient.close()
+                if (url.isNotBlank() && vpnRunning) {
+                    startMeshTunnel()
+                }
+                appendLog("INFO", "Relay", myVirtualIp, if (url.isBlank()) "Relay DERP desactivado" else "Relay DERP guardado: $url")
+                refreshAllUi()
+            }
+        }
+
         deviceCard.addView(devTop)
         deviceCard.addView(connHeader)
         deviceCard.addView(connSub)
@@ -2618,6 +2655,9 @@ class MainActivity : AppCompatActivity() {
         deviceCard.addView(kaRow)
         deviceCard.addView(recBox)
         deviceCard.addView(settingsStunText)
+        deviceCard.addView(relayLabel)
+        deviceCard.addView(relayUrlInput)
+        deviceCard.addView(relaySaveBtn)
 
         // Android Anti-Kill Survival Guide Card with Prominent Verification Button & Live Audit Banner
         guideCard = LinearLayout(this).apply {

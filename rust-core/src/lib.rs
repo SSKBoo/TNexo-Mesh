@@ -275,3 +275,31 @@ pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_openPacket<'a>(
         Err(_) => empty,
     }
 }
+
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_getSigningPublicKey(
+    mut env: JNIEnv,
+    _class: JClass,
+    seed: JString,
+) -> jstring {
+    let s: String = env.get_string(&seed).map(|v| v.into()).unwrap_or_default();
+    let pub_b64 = keys::signing_public_key_b64(&s);
+    env.new_string(pub_b64)
+        .expect("Couldn't create java string")
+        .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_signChallenge(
+    mut env: JNIEnv,
+    _class: JClass,
+    seed: JString,
+    nonce: JString,
+) -> jstring {
+    let s: String = env.get_string(&seed).map(|v| v.into()).unwrap_or_default();
+    let n: String = env.get_string(&nonce).map(|v| v.into()).unwrap_or_default();
+    let (_, sig_b64) = keys::sign_challenge_b64(&s, &n);
+    env.new_string(sig_b64)
+        .expect("Couldn't create java string")
+        .into_raw()
+}

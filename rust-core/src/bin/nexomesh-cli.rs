@@ -99,12 +99,34 @@ fn run_tunnel(args: &[String]) {
     let mut ws: Option<WsClient> = match &relay_url {
         Some(url) => match WsClient::connect(url) {
             Ok(mut client) => {
-                let reg = format!(r#"{{"type":"register","from":"{node_id}"}}"#);
+                let (sign_pub, _) = nexomesh_core::keys::sign_challenge_b64(&local_key, "");
+                // Esperar brevemente por si el servidor envía `{type:"challenge",nonce}`
+                let mut reg_id = node_id.clone();
+                let mut sig = String::new();
+                if let Ok(Some(WsFrame::Text(first))) = client.recv_frame() {
+                    if extract_json_str(&first, "type").as_deref() == Some("challenge") {
+                        if let Some(nonce) = extract_json_str(&first, "nonce") {
+                            let (pub_b64, sig_b64) =
+                                nexomesh_core::keys::sign_challenge_b64(&local_key, &nonce);
+                            reg_id = pub_b64;
+                            sig = sig_b64;
+                        }
+                    }
+                }
+                let reg = if sig.is_empty() {
+                    format!(r#"{{"type":"register","from":"{reg_id}"}}"#)
+                } else {
+                    format!(r#"{{"type":"register","from":"{reg_id}","signature":"{sig}"}}"#)
+                };
                 if let Err(e) = client.send_text(&reg) {
                     eprintln!("[RELAY] error al registrar en {url}: {e}");
                     None
                 } else {
-                    println!("[RELAY] conectado a {url} como '{node_id}'");
+                    println!(
+                        "[RELAY] conectado a {url} como '{}' (signingPub={})",
+                        reg_id,
+                        &sign_pub[..sign_pub.len().min(12)]
+                    );
                     Some(client)
                 }
             }

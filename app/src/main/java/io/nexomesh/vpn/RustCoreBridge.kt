@@ -25,4 +25,8 @@ object RustCoreBridge {
     external fun initSession(peerId: String, localKey: String, peerKey: String): Boolean
     external fun sealPacket(peerId: String, plaintext: ByteArray): ByteArray
     external fun openPacket(peerId: String, frame: ByteArray): ByteArray
+
+    // Firma Ed25519 para challenge-response de señalización/relay
+    external fun getSigningPublicKey(seed: String): String
+    external fun signChallenge(seed: String, nonce: String): String
 }

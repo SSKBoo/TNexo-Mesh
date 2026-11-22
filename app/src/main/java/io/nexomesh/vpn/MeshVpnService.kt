@@ -280,8 +280,15 @@ class MeshVpnService : VpnService() {
         val relayUrl = intent?.getStringExtra("RELAY_URL")
             ?: prefs.getString("relay_url", "") ?: ""
         if (relayUrl.isNotBlank() && !RelayClient.isConnected()) {
-            val id = localPublicKey.ifBlank { localIp }
-            RelayClient.connect(relayUrl, id, "")
+            val seed = localPublicKey.ifBlank { localIp }
+            if (RustCoreBridge.isNativeReady()) {
+                val signingPub = RustCoreBridge.getSigningPublicKey(seed)
+                RelayClient.connect(relayUrl, signingPub, "") { nonce ->
+                    RustCoreBridge.signChallenge(seed, nonce)
+                }
+            } else {
+                RelayClient.connect(relayUrl, seed, "")
+            }
         }
     }
 
