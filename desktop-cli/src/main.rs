@@ -2,8 +2,10 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+mod gui;
 
 #[derive(Clone, Copy)]
 enum TransportMode {
@@ -22,7 +24,7 @@ fn select_policy(mode: TransportMode) -> (u16, u16, &'static str) {
     }
 }
 
-fn probe_stun(server: &str) -> Result<String, String> {
+pub fn probe_stun(server: &str) -> Result<String, String> {
     let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("Error bind UDP: {e}"))?;
     let _ = sock.set_read_timeout(Some(Duration::from_millis(1500)));
     let mut req = [0u8; 20];
@@ -57,78 +59,109 @@ fn export_wireguard_conf(path: &str, local_ip: &str, mtu: u16, keepalive: u16, p
     let _ = fs::write(path, conf);
 }
 
-fn send_file_p2p(file_path: &str, target_ip: &str) -> Result<(), String> {
-    let data = fs::read(file_path).map_err(|e| format!("Error leyendo {file_path}: {e}"))?;
-    let name = Path::new(file_path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("archivo.bin");
+pub fn send_bytes_p2p(name: &str, data: &[u8], target_ip: &str) -> Result<String, String> {
     let addr = if target_ip.contains(':') {
         target_ip.to_string()
     } else {
         format!("{target_ip}:51821")
     };
     let mut stream = TcpStream::connect(&addr).map_err(|e| format!("Error conectando a {addr}: {e}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let header = format!("NEXOMESH_FILE\n{name}\n{}\n", data.len());
     stream.write_all(header.as_bytes()).map_err(|e| format!("Error enviando cabecera: {e}"))?;
-    stream.write_all(&data).map_err(|e| format!("Error enviando bytes: {e}"))?;
+    stream.write_all(data).map_err(|e| format!("Error enviando bytes: {e}"))?;
     stream.flush().map_err(|e| format!("Error flush: {e}"))?;
-    println!("[ARCHIVO] '{name}' ({} bytes) enviado a {addr}", data.len());
+    let mut ack_buf = [0u8; 256];
+    let ack = match stream.read(&mut ack_buf) {
+        Ok(n) if n > 0 => String::from_utf8_lossy(&ack_buf[..n]).trim().to_string(),
+        _ => String::new(),
+    };
+    let msg = if ack.starts_with("NEXOMESH_ACK|OK") {
+        format!("'{name}' ({} bytes) confirmado por {addr}", data.len())
+    } else {
+        format!("'{name}' ({} bytes) enviado a {addr}", data.len())
+    };
+    println!("[ARCHIVO] {msg}");
+    Ok(msg)
+}
+
+fn send_file_p2p(file_path: &str, target_ip: &str) -> Result<(), String> {
+    let data = fs::read(file_path).map_err(|e| format!("Error leyendo {file_path}: {e}"))?;
+    let name = Path::new(file_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("archivo.bin");
+    send_bytes_p2p(name, &data, target_ip)?;
     Ok(())
+}
+
+pub fn handle_incoming_file_conn(mut stream: TcpStream, save_dir: &Path) -> Option<(String, u64)> {
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut magic = String::new();
+    let mut name = String::new();
+    let mut size_str = String::new();
+    if reader.read_line(&mut magic).is_ok()
+        && magic.trim() == "NEXOMESH_FILE"
+        && reader.read_line(&mut name).is_ok()
+        && reader.read_line(&mut size_str).is_ok()
+    {
+        let clean_name = Path::new(name.trim())
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("recibido.bin")
+            .to_string();
+        let size: u64 = size_str.trim().parse().unwrap_or(0);
+        let max_bytes: u64 = std::env::var("NEXOMESH_MAX_FILE_BYTES")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(2 * 1024 * 1024 * 1024);
+        if size > max_bytes {
+            eprintln!("[RECEPTOR] Rechazado '{clean_name}': {size} bytes > limite {max_bytes}");
+            return None;
+        }
+        let target_path = save_dir.join(&clean_name);
+        match fs::File::create(&target_path) {
+            Ok(mut out) => {
+                let mut buf = [0u8; 65_536];
+                let mut remaining = size;
+                let mut ok = true;
+                while remaining > 0 {
+                    let want = remaining.min(buf.len() as u64) as usize;
+                    match reader.read(&mut buf[..want]) {
+                        Ok(0) => { ok = false; break; }
+                        Ok(n) => { if out.write_all(&buf[..n]).is_err() { ok = false; break; } remaining -= n as u64; }
+                        Err(_) => { ok = false; break; }
+                    }
+                }
+                if ok {
+                    let _ = stream.write_all(format!("NEXOMESH_ACK|OK|{size}|desktop\n").as_bytes());
+                    let _ = stream.flush();
+                    println!("[RECEPTOR] Guardado '{}' ({size} bytes)", target_path.display());
+                    return Some((clean_name, size));
+                } else {
+                    eprintln!("[RECEPTOR] Transferencia incompleta de '{clean_name}'");
+                }
+            }
+            Err(e) => eprintln!("[RECEPTOR] No se pudo crear '{}': {e}", target_path.display()),
+        }
+    }
+    None
 }
 
 fn receive_files_p2p() -> Result<(), String> {
     let listener = TcpListener::bind("0.0.0.0:51821").map_err(|e| format!("Error puerto 51821: {e}"))?;
+    let save_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     println!("[RECEPTOR] Escuchando archivos P2P en TCP :51821...");
     for stream in listener.incoming().flatten() {
-        let mut reader = BufReader::new(stream);
-        let mut magic = String::new();
-        let mut name = String::new();
-        let mut size_str = String::new();
-        if reader.read_line(&mut magic).is_ok()
-            && magic.trim() == "NEXOMESH_FILE"
-            && reader.read_line(&mut name).is_ok()
-            && reader.read_line(&mut size_str).is_ok()
-        {
-            let clean_name = Path::new(name.trim())
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("recibido.bin")
-                .to_string();
-            let size: u64 = size_str.trim().parse().unwrap_or(0);
-            // Streaming con buffer fijo de 64 KB y limite configurable: nunca
-            // se asigna un vector del tamano total del archivo (evita OOM).
-            let max_bytes: u64 = std::env::var("NEXOMESH_MAX_FILE_BYTES")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(2 * 1024 * 1024 * 1024);
-            if size > max_bytes {
-                eprintln!("[RECEPTOR] Rechazado '{clean_name}': {size} bytes > limite {max_bytes}");
-                continue;
-            }
-            match fs::File::create(&clean_name) {
-                Ok(mut out) => {
-                    let mut buf = [0u8; 65_536];
-                    let mut remaining = size;
-                    let mut ok = true;
-                    while remaining > 0 {
-                        let want = remaining.min(buf.len() as u64) as usize;
-                        match reader.read(&mut buf[..want]) {
-                            Ok(0) => { ok = false; break; }
-                            Ok(n) => { if out.write_all(&buf[..n]).is_err() { ok = false; break; } remaining -= n as u64; }
-                            Err(_) => { ok = false; break; }
-                        }
-                    }
-                    if ok { println!("[RECEPTOR] Guardado '{clean_name}' ({size} bytes)"); }
-                    else { eprintln!("[RECEPTOR] Transferencia incompleta de '{clean_name}'"); }
-                }
-                Err(e) => eprintln!("[RECEPTOR] No se pudo crear '{clean_name}': {e}"),
-            }
-        }
+        let _ = handle_incoming_file_conn(stream, &save_dir);
     }
     Ok(())
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args.len() == 1 || args.iter().any(|a| a == "--gui") {
+        gui::run_gui();
+        return;
+    }
     let mut mode = TransportMode::Auto;
     let mut stun_server = String::from("stun.l.google.com:19302");
     let mut join_uri: Option<String> = None;
