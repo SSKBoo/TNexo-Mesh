@@ -175,5 +175,26 @@ object FileTransferCore {
         return sb.toString()
     }
 
+    /** Guarda un archivo recibido cifrado dentro de un frame NM1 (vía Relay/UDP). */
+    fun saveRelayedFile(context: Context, senderIp: String, rawName: String, data: ByteArray) {
+        if (saveDir == null) {
+            saveDir = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "NexoMesh").apply { mkdirs() }
+        }
+        val safeName = File(rawName).name.ifBlank { "recibido-${System.currentTimeMillis()}" }
+        val digest = MessageDigest.getInstance("SHA-256")
+        digest.update(data)
+        val sha = hex(digest.digest())
+        val safOut = openOutput?.invoke(safeName)
+        val outFile = File(saveDir, safeName)
+        val target = safOut ?: FileOutputStream(outFile)
+        target.use { os ->
+            os.write(data)
+            os.flush()
+        }
+        onReceived?.invoke(
+            Received(safeName, data.size.toLong(), sha, senderIp, if (safOut == null) outFile.absolutePath else null, false, 1)
+        )
+    }
+
     private fun hex(bytes: ByteArray): String = bytes.joinToString("") { "%02x".format(it) }
 }

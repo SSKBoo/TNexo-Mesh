@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+nexomesh_core = { path = "../rust-core" }
 snow = "0.10"
-x25519-dalek = "2.0"

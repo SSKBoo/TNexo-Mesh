@@ -327,6 +327,24 @@ class MeshVpnService : VpnService() {
         val tunOut = FileOutputStream(descriptor.fileDescriptor)
         val lockWrite = Any()
 
+            fun deliverDecrypted(senderVip: String, packet: ByteArray) {
+                if (packet.size > 5 && packet[0] == 'N'.code.toByte() && packet[1] == 'M'.code.toByte() &&
+                    packet[2] == '_'.code.toByte() && packet[3] == 'F'.code.toByte() && packet[4] == '|'.code.toByte()) {
+                    val nl = (5 until packet.size).firstOrNull { packet[it] == '\n'.code.toByte() } ?: return
+                    val name = String(packet, 5, nl - 5, Charsets.UTF_8)
+                    val data = packet.copyOfRange(nl + 1, packet.size)
+                    FileTransferCore.saveRelayedFile(this@MeshVpnService, senderVip, name, data)
+                    addRxBytes(data.size)
+                    return
+                }
+                if (packet.isNotEmpty() && ((packet[0].toInt() ushr 4) and 0x0F) == 4) {
+                    synchronized(lockWrite) { tunOut.write(packet, 0, packet.size) }
+                    addRxBytes(packet.size)
+                } else {
+                    android.util.Log.w("NexoMeshRelay", "openPacket vacío/inválido desde $senderVip (${packet.size}B)")
+                }
+            }
+
             // Los frames que llegan por el relay WSS se descifran y se inyectan
             // en el TUN exactamente igual que los recibidos por UDP directo.
             RelayClient.onFrameReceived = { frame ->
@@ -338,12 +356,7 @@ class MeshVpnService : VpnService() {
                             val packet = if (RustCoreBridge.isNativeReady()) {
                                 RustCoreBridge.openPacket(senderVip, frame.copyOfRange(4 + senderLen, frame.size))
                             } else frame.copyOfRange(4 + senderLen, frame.size)
-                            if (packet.isNotEmpty() && ((packet[0].toInt() ushr 4) and 0x0F) == 4) {
-                                synchronized(lockWrite) { tunOut.write(packet, 0, packet.size) }
-                                addRxBytes(packet.size)
-                            } else {
-                                android.util.Log.w("NexoMeshRelay", "openPacket vacío/inválido desde $senderVip (${frame.size}B)")
-                            }
+                            deliverDecrypted(senderVip, packet)
                         }
                     }
                 } catch (_: Exception) {
@@ -516,6 +529,17 @@ class MeshVpnService : VpnService() {
                             val packet = if (RustCoreBridge.isNativeReady()) {
                                 RustCoreBridge.openPacket(senderVip, frame)
                             } else frame
+                            if (packet.size > 5 && packet[0] == 'N'.code.toByte() && packet[1] == 'M'.code.toByte() &&
+                                packet[2] == '_'.code.toByte() && packet[3] == 'F'.code.toByte() && packet[4] == '|'.code.toByte()) {
+                                val nl = (5 until packet.size).firstOrNull { packet[it] == '\n'.code.toByte() }
+                                if (nl != null) {
+                                    val name = String(packet, 5, nl - 5, Charsets.UTF_8)
+                                    val data = packet.copyOfRange(nl + 1, packet.size)
+                                    FileTransferCore.saveRelayedFile(this@MeshVpnService, senderVip, name, data)
+                                    addRxBytes(data.size)
+                                }
+                                continue
+                            }
                             if (packet.isEmpty() || ((packet[0].toInt() ushr 4) and 0x0F) != 4) continue
                             val srcIp = "${packet[12].toInt() and 0xFF}.${packet[13].toInt() and 0xFF}.${packet[14].toInt() and 0xFF}.${packet[15].toInt() and 0xFF}"
                             if (quarantinedIps.contains(srcIp)) { blockedPacketsCount += 1L; continue }
