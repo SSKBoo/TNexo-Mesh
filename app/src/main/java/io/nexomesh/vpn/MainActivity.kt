@@ -1612,6 +1612,14 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.parseColor("#94A3B8"))
         }
         fileReceiveSection.addView(fileReceiveFolderBtn)
+        val openFolderBtn = makeStyledButton("📂 Abrir carpeta de descargas", "#0C4A6E", "#38BDF8", "#BAE6FD").apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
+            setOnClickListener { openDownloadsFolder() }
+        }
+        fileReceiveSection.addView(openFolderBtn)
         fileReceiveSection.addView(fileReceiverToggleBtn)
         fileReceiveSection.addView(fileReceiverHostInfo)
 
@@ -1641,6 +1649,16 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.parseColor("#F8FAFC"))
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
+        val openQueueFolderBtn = makeStyledButton("📂", themeInset(), "#334155", "#7DD3FC", 10).apply {
+            textSize = 13f
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            minHeight = dp(32)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { rightMargin = dp(6) }
+            setOnClickListener { openDownloadsFolder() }
+        }
         val clearTransfersBtn = makeStyledButton("🗑️ Limpiar", themeInset(), "#334155", "#94A3B8", 10).apply {
             textSize = 11f
             setPadding(dp(10), dp(4), dp(10), dp(4))
@@ -1652,6 +1670,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         qHeaderRow.addView(qTitle)
+        qHeaderRow.addView(openQueueFolderBtn)
         qHeaderRow.addView(clearTransfersBtn)
         val liquidLegend = TextView(this).apply {
             text = "💧 OK  ·  ❄️ Pausa  ·  💔 Error  ·  ⭕ Cancelado"
@@ -4974,6 +4993,29 @@ class MainActivity : AppCompatActivity() {
             if (b != '\r'.code) sb.append(b.toChar())
         }
         return sb.toString()
+    }
+
+    private fun openDownloadsFolder() {
+        val tree = receiveFolderUri
+        if (tree != null) {
+            try {
+                val docId = DocumentsContract.getTreeDocumentId(tree)
+                val docUri = DocumentsContract.buildDocumentUriUsingTree(tree, docId)
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(docUri, "vnd.android.document/directory")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                startActivity(intent)
+                return
+            } catch (_: Exception) {
+            }
+        }
+        try {
+            startActivity(Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS))
+        } catch (_: Exception) {
+            appendLog("INFO", "Archivos", myVirtualIp, "Carpeta local: ${getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)}/NexoMesh")
+            refreshAllUi()
+        }
     }
 
     private fun shareOrOpenLocalFile(file: File) {
