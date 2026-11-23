@@ -36,8 +36,12 @@ object RustCoreBridge {
     external fun addAclRule(allow: Boolean, srcCidr: String, dstCidr: String, ipProto: Int, dstPort: Int)
     external fun checkAclPacket(srcIp: String, dstIp: String, ipProto: Int, dstPort: Int): Boolean
 
-    // Rotación PFS efímera automática
+    // Rotación PFS efímera automática + handshake 1-RTT Noise IKpsk2
     external fun needsRekey(peerId: String): Boolean
     external fun beginPfsRekey(peerId: String): ByteArray
     external fun finishPfsRekey(peerId: String, peerEphPub: ByteArray): Boolean
+    external fun beginNoiseIkHandshake(peerId: String): ByteArray
+    external fun respondNoiseIkHandshake(peerId: String, msg1: ByteArray): ByteArray
+    external fun completeNoiseIkHandshake(peerId: String, msg2: ByteArray): Boolean
+    external fun isNoiseIkEstablished(peerId: String): Boolean
 }

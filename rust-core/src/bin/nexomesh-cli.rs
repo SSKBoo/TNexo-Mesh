@@ -1,5 +1,6 @@
 use nexomesh_core::derp::{
-    build_icmp_echo_request, try_build_icmp_echo_reply, Node, NodeEvent,
+    build_icmp_echo_request, probe_derp_regions, try_build_icmp_echo_reply, DerpRegion, Node,
+    NodeEvent,
 };
 use nexomesh_core::session;
 use nexomesh_core::ws_client::{base64_decode, extract_json_str, WsClient, WsFrame};
@@ -20,6 +21,7 @@ fn main() {
             println!("public={}", hex(pk.as_bytes()));
         }
         "status" => println!("status ok"),
+        "netcheck" => run_netcheck(&args[2..]),
         "tunnel" => run_tunnel(&args[2..]),
         _ => print_usage(),
     }
@@ -27,8 +29,28 @@ fn main() {
 
 fn print_usage() {
     println!(
-        "nexomesh-cli: keygen | status | tunnel --local <vip> --peer <vip> [--port N] [--peer-addr ip:port] [--relay [ws://host:port/ws]] [--id nombre] [--ping]"
+        "nexomesh-cli: keygen | status | netcheck [--stun host:port] [--derp ws://host:port/ws] | tunnel --local <vip> --peer <vip> [--port N] [--peer-addr ip:port] [--relay [ws://host:port/ws]] [--id nombre] [--ping]"
     );
+}
+
+fn run_netcheck(args: &[String]) {
+    let stun = arg(args, "--stun").unwrap_or_else(|| "stun.l.google.com:19302".to_string());
+    let derp_ep = arg(args, "--derp").unwrap_or_else(|| "ws://127.0.0.1:8080/ws".to_string());
+    let stun_res = nexomesh_core::stun::probe_stun_endpoint(&stun)
+        .unwrap_or_else(|e| format!("error:{e}"));
+    let mut regions = vec![DerpRegion {
+        id: 1,
+        name: "configured".to_string(),
+        endpoint: derp_ep,
+        rtt_ms: u32::MAX,
+    }];
+    probe_derp_regions(&mut regions);
+    let node = Node::bind("10.0.0.2", "10.0.0.1", 0).ok();
+    let report = node
+        .as_ref()
+        .map(|n| n.netcheck_json(&regions))
+        .unwrap_or_else(|| "{}".to_string());
+    println!("{{\"stun\":\"{stun_res}\",\"netcheck\":{report}}}");
 }
 
 fn arg(args: &[String], key: &str) -> Option<String> {

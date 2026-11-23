@@ -22,13 +22,40 @@ export function parseDerpRegionsEnv(): Array<{ id: number; name: string; host: s
   ];
 }
 
-export function createApp(authority: NetMapAuthority = new NetMapAuthority(getStore())) {
+export function createApp(
+  authority: NetMapAuthority = new NetMapAuthority(getStore()),
+  hub?: SignalingHub,
+  router?: DerpMeshRouter
+) {
   const app = express();
   app.use(express.json());
   app.get("/health", (_req, res) => res.json({ ok: true, service: "nexomesh-backend" }));
-  app.get("/derp/ping", (_req, res) => res.json({ pong: Date.now(), regionId: Number(process.env.DERP_REGION_ID ?? 1) }));
+  app.get("/derp/ping", (_req, res) =>
+    res.json({ pong: Date.now(), regionId: hub?.regionId ?? Number(process.env.DERP_REGION_ID ?? 1) })
+  );
   app.get("/derp-map", (_req, res) => {
     res.json({ regions: parseDerpRegionsEnv() });
+  });
+  app.get("/derp/mesh/homes", (_req, res) => {
+    res.json({ homes: router ? router.snapshotHomes() : {} });
+  });
+  app.post("/derp/mesh/announce", (req, res) => {
+    const { peerKey, regionId } = req.body ?? {};
+    if (!router || typeof peerKey !== "string" || typeof regionId !== "number") {
+      res.status(400).json({ error: "invalid announce payload" });
+      return;
+    }
+    router.setHomeRegion(peerKey, regionId);
+    res.json({ ok: true });
+  });
+  app.post("/derp/mesh/deliver", (req, res) => {
+    const { from, targetKey, payloadB64 } = req.body ?? {};
+    if (!hub || typeof from !== "string" || typeof targetKey !== "string" || typeof payloadB64 !== "string") {
+      res.status(400).json({ error: "invalid federation frame" });
+      return;
+    }
+    const delivered = hub.deliverFromRemoteRegion(from, targetKey, payloadB64);
+    res.status(delivered ? 200 : 404).json({ ok: delivered });
   });
   app.post("/netmap/register", (req, res) => {
     try {
@@ -74,14 +101,13 @@ export function createApp(authority: NetMapAuthority = new NetMapAuthority(getSt
 export function start(port: number = 8080, signalingPort: number = 8443): void {
   const store = getStore();
   const authority = new NetMapAuthority(store);
-  const app = createApp(authority);
+  const router = new DerpMeshRouter();
+  const hubPrimary = new SignalingHub(1, router, authority);
+  const app = createApp(authority, hubPrimary, router);
   const server = createServer(app);
   const requireSig = process.env.SIGNALING_REQUIRE_SIGNATURE !== "0";
   const isAuthorized = (from: string) =>
     authority.isActiveAndApproved(from) || store.isAuthorizedSigningKey(from);
-
-  const router = new DerpMeshRouter();
-  const hubPrimary = new SignalingHub(1, router, authority);
 
   attachSignalingToHttpServer(server, requireSig, isAuthorized, hubPrimary, "/ws", authority);
   server.listen(port, () => console.log(`HTTP + WS(/ws) listening on ${port}`));

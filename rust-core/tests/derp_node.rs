@@ -149,7 +149,7 @@ fn symmetric_nat_probe_sprays_birthday_sockets() {
     let node_a = Node::bind("10.0.0.30", "10.0.0.31", 0).unwrap();
     let node_b = Node::bind("10.0.0.31", "10.0.0.30", 0).unwrap();
     let port_b = node_b.local_port().unwrap();
-    let sent = node_a.probe_symmetric_nat(Ipv4Addr::LOCALHOST, port_b, 4, 77);
+    let sent = node_a.probe_symmetric_nat(Ipv4Addr::LOCALHOST, port_b, 1, 77);
     assert_eq!(sent, 32);
 }
 
@@ -255,4 +255,61 @@ fn derp_region_tcp_prober_selects_reachable_lowest_rtt() {
     probe_derp_regions(&mut regions);
     let best = select_nearest_derp_region(&regions).expect("debe elegir región viva");
     assert_eq!(best.id, 2);
+}
+
+#[test]
+fn noise_ik_1rtt_initial_handshake_and_netcheck_report() {
+    session::ensure_session("10.0.0.61", "NOISE_A", "NOISE_B").unwrap();
+    session::ensure_session("10.0.0.60", "NOISE_B", "NOISE_A").unwrap();
+
+    let mut node_a = Node::bind("10.0.0.60", "10.0.0.61", 0).unwrap();
+    let mut node_b = Node::bind("10.0.0.61", "10.0.0.60", 0).unwrap();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", node_a.local_port().unwrap()).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", node_b.local_port().unwrap()).parse().unwrap();
+    node_a.set_peer(addr_b);
+    node_b.set_peer(addr_a);
+
+    // 1-RTT Noise IKpsk2 inicial disparado automáticamente por start_noise_ik_handshake()
+    node_a.start_noise_ik_handshake().unwrap();
+    match node_b.poll_udp_once().unwrap() {
+        Some(NodeEvent::Rekeyed { vip }) => assert_eq!(vip, "10.0.0.60"),
+        other => panic!("esperaba Noise IK responder en B, obtuve {other:?}"),
+    }
+    match node_a.poll_udp_once().unwrap() {
+        Some(NodeEvent::Rekeyed { vip }) => assert_eq!(vip, "10.0.0.61"),
+        other => panic!("esperaba Noise IK initiator en A, obtuve {other:?}"),
+    }
+    assert!(session::is_noise_ik_established("10.0.0.61"));
+    assert!(session::is_noise_ik_established("10.0.0.60"));
+
+    // Tráfico IP cifrado bajo el transporte Noise IKpsk2 (frame v4)
+    let pkt = build_icmp_echo_request("10.0.0.60", "10.0.0.61", 88).unwrap();
+    let frame = node_a.build_nm1_frame(&pkt).unwrap();
+    let vip_len = frame[3] as usize;
+    assert_eq!(frame[4 + vip_len], 0x04, "debe usar Noise_IKpsk2 transport frame v4");
+    node_a.send_packet(&pkt).unwrap();
+    for _ in 0..40 {
+        match node_b.poll_udp_once().unwrap() {
+            Some(NodeEvent::Packet { sender_vip, packet }) => {
+                assert_eq!(sender_vip, "10.0.0.60");
+                assert_eq!(packet, pkt);
+                break;
+            }
+            Some(NodeEvent::DiscoPing { .. }) => continue,
+            other => panic!("esperaba Packet Noise IK en B, obtuve {other:?}"),
+        }
+    }
+
+    // Diagnóstico netcheck JSON + socket rebinding
+    let report = node_a.netcheck_json(&[DerpRegion {
+        id: 1,
+        name: "na".into(),
+        endpoint: "wss://na.example/ws".into(),
+        rtt_ms: 22,
+    }]);
+    assert!(report.contains("\"noise_ik_1rtt\":true"));
+    assert!(report.contains("\"mode\":\"direct\""));
+    let old_port = node_a.local_port().unwrap();
+    let new_port = node_a.rebind_udp().unwrap();
+    assert_ne!(new_port, old_port);
 }

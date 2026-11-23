@@ -39,6 +39,7 @@ struct GuiState {
     relay_url: String,
     peer_endpoint: String,
     last_stun: String,
+    netcheck_json: String,
     events: Vec<String>,
     save_dir: PathBuf,
     outbound_packets: Vec<Vec<u8>>,
@@ -132,6 +133,7 @@ pub fn run_gui() {
         relay_url: String::new(),
         peer_endpoint: String::new(),
         last_stun: String::new(),
+        netcheck_json: "{}".to_string(),
         events: vec![format!("📂 Carpeta: {}", save_dir.display())],
         save_dir,
         outbound_packets: Vec::new(),
@@ -276,6 +278,15 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<GuiState>>) {
             }
             state.lock().unwrap().events.insert(0, format!("🌐 {res}"));
             let json = format!("{{\"result\":\"{}\"}}", escape_json(&res));
+            write_http(&mut stream, "200 OK", "application/json", json.as_bytes());
+        }
+        ("GET", "/api/netcheck") => {
+            let g = state.lock().unwrap();
+            let json = format!(
+                "{{\"stun\":\"{}\",\"split_dns\":[\".nexomesh\",\".mesh\"],\"node\":{}}}",
+                escape_json(&g.last_stun),
+                g.netcheck_json
+            );
             write_http(&mut stream, "200 OK", "application/json", json.as_bytes());
         }
         ("POST", "/api/join") => {
@@ -631,6 +642,7 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
         {
             let mut g = state.lock().unwrap();
             let direct_now = node.using_direct();
+            g.netcheck_json = node.netcheck_json(&[]);
             if g.direct_udp && !direct_now {
                 g.direct_udp = false;
                 g.events.insert(0, "🔁 Degradado a relay DERP NM2 (P2P sin respuesta)".to_string());

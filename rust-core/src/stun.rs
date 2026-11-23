@@ -60,3 +60,14 @@ pub fn parse_mapped_address(buf: &[u8]) -> Option<String> {
     }
     None
 }
+
+/// Consulta un servidor STUN (`host:port`) mediante UDP Binding Request y devuelve `"ip:puerto"`.
+pub fn probe_stun_endpoint(server: &str) -> Result<String, String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("udp bind: {e}"))?;
+    let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(900)));
+    let req = stun_binding_request();
+    sock.send_to(&req, server).map_err(|e| format!("udp send: {e}"))?;
+    let mut resp = [0u8; 256];
+    let (n, _) = sock.recv_from(&mut resp).map_err(|e| format!("udp recv: {e}"))?;
+    parse_mapped_address(&resp[..n]).ok_or_else(|| "sin atributo MAPPED-ADDRESS".to_string())
+}

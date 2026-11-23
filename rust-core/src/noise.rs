@@ -4,7 +4,7 @@
 //! mediante `snow::Builder` sin modos de prueba fijos.
 
 use snow::params::NoiseParams;
-use snow::{Builder, HandshakeState, TransportState};
+use snow::{Builder, HandshakeState, StatelessTransportState, TransportState};
 
 pub const NOISE_PATTERN: &str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 pub const PSK_LEN: usize = 32;
@@ -33,6 +33,31 @@ impl NoiseSession {
     /// Descifra un mensaje de transporte. Devuelve el número de bytes leídos.
     pub fn open(&mut self, ciphertext: &[u8], out: &mut [u8]) -> Result<usize, snow::Error> {
         self.transport.read_message(ciphertext, out)
+    }
+}
+
+/// Sesión de transporte Noise IKpsk2 stateless para datagramas UDP (nonce explícito + anti-replay).
+pub struct StatelessNoiseSession {
+    transport: StatelessTransportState,
+}
+
+impl StatelessNoiseSession {
+    pub fn seal_with_nonce(
+        &self,
+        nonce: u64,
+        plaintext: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, snow::Error> {
+        self.transport.write_message(nonce, plaintext, out)
+    }
+
+    pub fn open_with_nonce(
+        &self,
+        nonce: u64,
+        ciphertext: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, snow::Error> {
+        self.transport.read_message(nonce, ciphertext, out)
     }
 }
 
@@ -77,6 +102,18 @@ impl NoiseInitiator {
             transport: self.state.into_transport_mode()?,
         })
     }
+
+    /// Entra en modo transporte stateless (con nonce explícito de 64 bits para UDP/anti-replay).
+    pub fn read_msg2_into_stateless_session(
+        mut self,
+        msg2: &[u8],
+    ) -> Result<StatelessNoiseSession, snow::Error> {
+        let mut out = [0u8; 256];
+        self.state.read_message(msg2, &mut out)?;
+        Ok(StatelessNoiseSession {
+            transport: self.state.into_stateless_transport_mode()?,
+        })
+    }
 }
 
 /// Responde un handshake IKpsk2 recibido por la red generando su propio efímero aleatorio.
@@ -98,6 +135,29 @@ pub fn respond_handshake(
         msg2,
         NoiseSession {
             transport: responder.into_transport_mode()?,
+        },
+    ))
+}
+
+/// Responde un handshake IKpsk2 entrando en modo transporte stateless para UDP/anti-replay.
+pub fn respond_stateless_handshake(
+    responder_priv: &[u8],
+    psk: &[u8; PSK_LEN],
+    msg1: &[u8],
+) -> Result<(Vec<u8>, StatelessNoiseSession), snow::Error> {
+    let mut responder = Builder::new(params())
+        .local_private_key(responder_priv)?
+        .psk(2, psk)?
+        .build_responder()?;
+    let mut read = [0u8; 256];
+    responder.read_message(msg1, &mut read)?;
+    let mut msg2 = vec![0u8; 256];
+    let n = responder.write_message(&[], &mut msg2)?;
+    msg2.truncate(n);
+    Ok((
+        msg2,
+        StatelessNoiseSession {
+            transport: responder.into_stateless_transport_mode()?,
         },
     ))
 }

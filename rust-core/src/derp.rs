@@ -236,9 +236,9 @@ impl Node {
         Ok(packet)
     }
 
-    /// Procesa un frame entrante desde el relay DERP (soporta paquetes `NM1` cifrados y `NM_REKEY_*`).
+    /// Procesa un frame entrante desde el relay DERP (soporta paquetes `NM1` cifrados, `NM_REKEY_*` y `NM_NOISE_*`).
     pub fn feed_relay_event(&mut self, frame: &[u8]) -> Result<Option<NodeEvent>> {
-        if frame.starts_with(b"NM_REKEY_") {
+        if frame.starts_with(b"NM_REKEY_") || frame.starts_with(b"NM_NOISE_") {
             return self.handle_control_packet(frame, None);
         }
         let (sender_vip, packet) = Self::parse_nm1_frame(frame)?;
@@ -314,9 +314,81 @@ impl Node {
         Err(anyhow!("sin transporte disponible para NM_REKEY_INIT"))
     }
 
+    /// Inicia un handshake inicial 1-RTT `Noise_IKpsk2` con efímero aleatorio desde el primer paquete.
+    pub fn start_noise_ik_handshake(&mut self) -> Result<()> {
+        let msg1 = session::begin_noise_ik_handshake(&self.peer_vip)?;
+        let wire = format!("NM_NOISE_1|{}|{}", self.local_vip, base64_encode(&msg1));
+        if let Some(addr) = self.peer_addr {
+            if self.sock.send_to(wire.as_bytes(), addr).is_ok() {
+                return Ok(());
+            }
+        }
+        if self.relay_tx.is_some() {
+            return self.send_via_relay(wire.as_bytes());
+        }
+        Err(anyhow!("sin transporte para NM_NOISE_1"))
+    }
+
+    /// Re-vincula el socket UDP (Socket Rebinding para roaming Wi-Fi <-> 4G/5G) y relanza sondas Disco.
+    pub fn rebind_udp(&mut self) -> Result<u16> {
+        let fresh = UdpSocket::bind("0.0.0.0:0")?;
+        fresh.set_read_timeout(Some(Duration::from_millis(50)))?;
+        let new_port = fresh.local_addr()?.port();
+        self.sock = fresh;
+        *self.direct_ok.lock().unwrap() = false;
+        *self.last_direct_rx.lock().unwrap() = None;
+        let _ = self.probe_candidates();
+        Ok(new_port)
+    }
+
+    /// Genera reporte diagnóstico estilo `tailscale netcheck / status` en JSON.
+    pub fn netcheck_json(&self, derp_regions: &[DerpRegion]) -> String {
+        let direct = self.using_direct();
+        let endpoint = self.peer_addr.map(|a| a.to_string()).unwrap_or_default();
+        let direct_rtt = self
+            .last_disco_rtt_ms()
+            .map(|ms| ms.to_string())
+            .unwrap_or_else(|| "null".to_string());
+        let noise_ik = session::is_noise_ik_established(&self.peer_vip);
+        let cand_json: Vec<String> = self
+            .candidates
+            .iter()
+            .map(|c| {
+                let rtt = c.rtt_ms.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string());
+                let kind = match c.kind {
+                    RouteKind::Lan => "lan",
+                    RouteKind::StunPublic => "stun",
+                    RouteKind::UpnpMapped => "upnp",
+                };
+                format!("{{\"addr\":\"{}\",\"kind\":\"{kind}\",\"rtt_ms\":{rtt}}}", c.addr)
+            })
+            .collect();
+        let derp_json: Vec<String> = derp_regions
+            .iter()
+            .map(|r| {
+                format!(
+                    "{{\"id\":{},\"name\":\"{}\",\"endpoint\":\"{}\",\"rtt_ms\":{}}}",
+                    r.id, r.name, r.endpoint, r.rtt_ms
+                )
+            })
+            .collect();
+        format!(
+            "{{\"local_vip\":\"{}\",\"peer_vip\":\"{}\",\"mode\":\"{}\",\"active_endpoint\":\"{}\",\"direct_rtt_ms\":{},\"noise_ik_1rtt\":{},\"candidates\":[{}],\"derp_regions\":[{}]}}",
+            self.local_vip,
+            self.peer_vip,
+            if direct { "direct" } else { "derp" },
+            endpoint,
+            direct_rtt,
+            noise_ik,
+            cand_json.join(","),
+            derp_json.join(",")
+        )
+    }
+
     /// Mantenimiento periódico del loop de transporte:
     /// 1) Evalúa degradación DERP + sondeo Disco multi-ruta cada 5s.
-    /// 2) Dispara rotación PFS automática al alcanzar 120s o límite de paquetes.
+    /// 2) Inicia 1-RTT `Noise_IKpsk2` si la sesión aún usa semilla estática.
+    /// 3) Dispara rotación PFS automática al alcanzar 120s o límite de paquetes.
     pub fn tick(&mut self) {
         self.fallback_to_relay_if_stale(Duration::from_secs(15));
         if self.last_disco_tick.elapsed() >= Duration::from_secs(5) {
@@ -330,6 +402,10 @@ impl Node {
             if !self.rekey_in_flight || allow_retry {
                 let _ = self.send_rekey_init();
             }
+        } else if session::should_start_noise_handshake(&self.peer_vip)
+            && (self.peer_addr.is_some() || self.relay_tx.is_some())
+        {
+            let _ = self.start_noise_ik_handshake();
         }
     }
 
@@ -517,6 +593,42 @@ impl Node {
                     session::finish_pfs_rekey(&self.peer_vip, &peer_eph)?;
                     self.rekey_in_flight = false;
                     return Ok(Some(NodeEvent::Rekeyed { vip }));
+                }
+            }
+            return Ok(None);
+        }
+
+        if pkt.starts_with(b"NM_NOISE_1|") {
+            let mut parts = text.split('|');
+            let _ = parts.next();
+            let vip = parts.next().unwrap_or("").trim().to_string();
+            let b64 = parts.next().unwrap_or("").trim();
+            if vip == self.peer_vip {
+                if let Ok(msg1) = base64_decode(b64) {
+                    if let Ok(msg2) = session::respond_noise_ik_handshake(&self.peer_vip, &msg1) {
+                        let wire = format!("NM_NOISE_2|{}|{}", self.local_vip, base64_encode(&msg2));
+                        if let Some(addr) = from.or(self.peer_addr) {
+                            let _ = self.sock.send_to(wire.as_bytes(), addr);
+                        } else if self.relay_tx.is_some() {
+                            let _ = self.send_via_relay(wire.as_bytes());
+                        }
+                        return Ok(Some(NodeEvent::Rekeyed { vip }));
+                    }
+                }
+            }
+            return Ok(None);
+        }
+
+        if pkt.starts_with(b"NM_NOISE_2|") {
+            let mut parts = text.split('|');
+            let _ = parts.next();
+            let vip = parts.next().unwrap_or("").trim().to_string();
+            let b64 = parts.next().unwrap_or("").trim();
+            if vip == self.peer_vip {
+                if let Ok(msg2) = base64_decode(b64) {
+                    if session::complete_noise_ik_handshake(&self.peer_vip, &msg2).is_ok() {
+                        return Ok(Some(NodeEvent::Rekeyed { vip }));
+                    }
                 }
             }
             return Ok(None);

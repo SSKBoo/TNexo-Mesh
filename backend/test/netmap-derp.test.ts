@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import WebSocket from "ws";
 import { NetMapAuthority, verifyIdentityBinding, verifySignedNetMap } from "../src/netmap.ts";
 import { attachSignalingToHttpServer, DerpMeshRouter, SignalingHub } from "../src/signaling.ts";
+import { createApp } from "../src/index.ts";
 import { Store } from "../src/store.ts";
 
 class FakeSocket {
@@ -192,4 +193,66 @@ test("WS register exige firma válida, vínculo X25519<->Ed25519 y aprobación e
   ws2.close();
   wss.close();
   await new Promise<void>((r) => server.close(() => r()));
+});
+
+test("Federación HTTP/WS entre dos servidores DERP independientes (Región NA <-> Región EU)", async () => {
+  const routerNa = new DerpMeshRouter();
+  const hubNa = new SignalingHub(1, routerNa);
+  const appNa = createApp(new NetMapAuthority(), hubNa, routerNa);
+  const srvNa = createServer(appNa);
+  const wssNa = attachSignalingToHttpServer(srvNa, false, () => true, hubNa, "/ws");
+
+  const routerEu = new DerpMeshRouter();
+  const hubEu = new SignalingHub(2, routerEu);
+  const appEu = createApp(new NetMapAuthority(), hubEu, routerEu);
+  const srvEu = createServer(appEu);
+  const wssEu = attachSignalingToHttpServer(srvEu, false, () => true, hubEu, "/ws");
+
+  await new Promise<void>((r) => srvNa.listen(0, "127.0.0.1", r));
+  await new Promise<void>((r) => srvEu.listen(0, "127.0.0.1", r));
+  const portNa = (srvNa.address() as { port: number }).port;
+  const portEu = (srvEu.address() as { port: number }).port;
+
+  routerNa.registerRemoteRegion(2, `http://127.0.0.1:${portEu}`);
+  routerEu.registerRemoteRegion(1, `http://127.0.0.1:${portNa}`);
+
+  const a = genEd();
+  const b = genEd();
+  // Anunciar que B reside en región 2 (EU)
+  routerNa.setHomeRegion(b.pubB64, 2);
+
+  const wsA = new WebSocket(`ws://127.0.0.1:${portNa}/ws`);
+  const wsB = new WebSocket(`ws://127.0.0.1:${portEu}/ws`);
+  await Promise.all([
+    new Promise<void>((r) => wsA.on("open", () => r())),
+    new Promise<void>((r) => wsB.on("open", () => r())),
+  ]);
+  wsA.send(JSON.stringify({ type: "register", from: a.pubB64 }));
+  wsB.send(JSON.stringify({ type: "register", from: b.pubB64 }));
+
+  const receivedB: Promise<any> = new Promise((resolve) => {
+    wsB.on("message", (raw) => {
+      const m = JSON.parse(String(raw));
+      if (m.type === "relay") resolve(m);
+    });
+  });
+
+  await new Promise((r) => setTimeout(r, 80));
+  const inner = Buffer.from("SECRET_CROSS_REGION_PAYLOAD");
+  const nm2 = Buffer.concat([Buffer.from("NM2"), b.pubRaw, inner]);
+  wsA.send(nm2);
+
+  const delivered = await receivedB;
+  assert.equal(delivered.from, a.pubB64);
+  assert.equal(delivered.viaRegion, 2);
+  assert.equal(Buffer.from(delivered.data, "base64").toString("hex"), inner.toString("hex"));
+
+  wsA.close();
+  wsB.close();
+  wssNa.close();
+  wssEu.close();
+  await Promise.all([
+    new Promise<void>((r) => srvNa.close(() => r())),
+    new Promise<void>((r) => srvEu.close(() => r())),
+  ]);
 });

@@ -184,6 +184,19 @@ class MeshVpnService : VpnService() {
             return context.getSharedPreferences("nexomesh_prefs", Context.MODE_PRIVATE)
                 .getBoolean("real_vpn_always_on", false)
         }
+
+        fun getNetcheckReportJson(): String {
+            val now = System.currentTimeMillis()
+            val peersJson = peerRoutes.values.joinToString(",") { p ->
+                val directAddr = learnedSocketAddrs[p.virtualIp]
+                val rxAge = lastDirectRxMs[p.virtualIp]?.let { now - it }
+                val isDirect = directAddr != null && rxAge != null && rxAge <= 15_000L
+                val mode = if (isDirect) "direct" else if (RelayClient.isConnected()) "derp" else "offline"
+                val ep = directAddr?.let { "${it.address?.hostAddress}:${it.port}" } ?: p.stunEndpoint
+                "{\"vip\":\"${p.virtualIp}\",\"name\":\"${p.name}\",\"mode\":\"$mode\",\"endpoint\":\"$ep\"}"
+            }
+            return "{\"service_running\":$isServiceRunning,\"local_vip\":\"$localVirtualIp\",\"relay_connected\":${RelayClient.isConnected()},\"udp_port\":${activeUdpSocket?.localPort ?: -1},\"peers\":[$peersJson]}"
+        }
     }
 
     private var tunFd: ParcelFileDescriptor? = null
@@ -537,7 +550,26 @@ class MeshVpnService : VpnService() {
                     }
                     if (rxBuf[0] == 'N'.code.toByte() && rxBuf[1] == 'M'.code.toByte() && rxBuf[2] == '_'.code.toByte()) {
                         val msg = String(rxBuf, 0, len, Charsets.UTF_8)
-                        if (msg.startsWith("NM_REKEY_INIT|") || msg.startsWith("NM_REKEY_ACK|")) {
+                        if (msg.startsWith("NM_NOISE_1|") || msg.startsWith("NM_NOISE_2|")) {
+                            val parts = msg.split("|")
+                            val peerVip = parts.getOrNull(1)?.trim() ?: ""
+                            val b64 = parts.getOrNull(2)?.trim() ?: ""
+                            if (peerVip.startsWith("10.0.0.") && peerVip != localIp && RustCoreBridge.isNativeReady()) {
+                                try {
+                                    val payload = java.util.Base64.getDecoder().decode(b64)
+                                    if (msg.startsWith("NM_NOISE_1|")) {
+                                        val msg2 = RustCoreBridge.respondNoiseIkHandshake(peerVip, payload)
+                                        if (msg2.isNotEmpty()) {
+                                            val wire = "NM_NOISE_2|$localIp|${java.util.Base64.getEncoder().encodeToString(msg2)}".toByteArray(Charsets.UTF_8)
+                                            sock.send(DatagramPacket(wire, wire.size, pkt.address, pkt.port))
+                                        }
+                                    } else {
+                                        RustCoreBridge.completeNoiseIkHandshake(peerVip, payload)
+                                    }
+                                } catch (_: Exception) {
+                                }
+                            }
+                        } else if (msg.startsWith("NM_REKEY_INIT|") || msg.startsWith("NM_REKEY_ACK|")) {
                             val parts = msg.split("|")
                             val peerVip = parts.getOrNull(1)?.trim() ?: ""
                             val b64 = parts.getOrNull(2)?.trim() ?: ""
@@ -674,12 +706,22 @@ class MeshVpnService : VpnService() {
                         val hello = "NM_HELLO|$localIp|${Build.MODEL}|keepalive|$localPublicKey".toByteArray(Charsets.UTF_8)
                         val disco = "NM_DISCO_PING|${System.currentTimeMillis()}|$localIp".toByteArray(Charsets.UTF_8)
                         for (peer in peerRoutes.values) {
-                            if (RustCoreBridge.isNativeReady() && RustCoreBridge.needsRekey(peer.virtualIp)) {
-                                val ourEph = RustCoreBridge.beginPfsRekey(peer.virtualIp)
-                                if (ourEph.size == 32) {
-                                    val rekeyMsg = "NM_REKEY_INIT|$localIp|${java.util.Base64.getEncoder().encodeToString(ourEph)}".toByteArray(Charsets.UTF_8)
-                                    resolvePeerTargets(peer.virtualIp).firstOrNull()?.let { target ->
-                                        try { sock.send(DatagramPacket(rekeyMsg, rekeyMsg.size, target.address, target.port)) } catch (_: Exception) {}
+                            if (RustCoreBridge.isNativeReady()) {
+                                if (!RustCoreBridge.isNoiseIkEstablished(peer.virtualIp)) {
+                                    val msg1 = RustCoreBridge.beginNoiseIkHandshake(peer.virtualIp)
+                                    if (msg1.isNotEmpty()) {
+                                        val wire = "NM_NOISE_1|$localIp|${java.util.Base64.getEncoder().encodeToString(msg1)}".toByteArray(Charsets.UTF_8)
+                                        resolvePeerTargets(peer.virtualIp).firstOrNull()?.let { target ->
+                                            try { sock.send(DatagramPacket(wire, wire.size, target.address, target.port)) } catch (_: Exception) {}
+                                        }
+                                    }
+                                } else if (RustCoreBridge.needsRekey(peer.virtualIp)) {
+                                    val ourEph = RustCoreBridge.beginPfsRekey(peer.virtualIp)
+                                    if (ourEph.size == 32) {
+                                        val rekeyMsg = "NM_REKEY_INIT|$localIp|${java.util.Base64.getEncoder().encodeToString(ourEph)}".toByteArray(Charsets.UTF_8)
+                                        resolvePeerTargets(peer.virtualIp).firstOrNull()?.let { target ->
+                                            try { sock.send(DatagramPacket(rekeyMsg, rekeyMsg.size, target.address, target.port)) } catch (_: Exception) {}
+                                        }
                                     }
                                 }
                             }

@@ -201,34 +201,164 @@ pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_inspectPacket(
 
 
 // ---------------------------------------------------------------------------
-// FFI C ABI (nexomesh_* symbols)
+// FFI C ABI (nexomesh_* symbols para iOS PacketTunnelProvider / Swift / C)
 // ---------------------------------------------------------------------------
-use std::ffi::{c_char, CString};
+use std::ffi::{c_char, CStr, CString};
 
 static LAST_STATUS: std::sync::Mutex<Option<CString>> = std::sync::Mutex::new(None);
+static LAST_NETCHECK: std::sync::Mutex<Option<CString>> = std::sync::Mutex::new(None);
+static FFI_NODE: OnceLock<Mutex<Option<derp::Node>>> = OnceLock::new();
+
+fn ffi_node() -> &'static Mutex<Option<derp::Node>> {
+    FFI_NODE.get_or_init(|| Mutex::new(None))
+}
+
+fn cstr_to_string(ptr: *const c_char, default: &str) -> String {
+    if ptr.is_null() {
+        return default.to_string();
+    }
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| default.to_string())
+}
 
 fn status_json() -> String {
+    let direct = ffi_node()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|n| n.using_direct())
+        .unwrap_or(false);
     format!(
-        "{{\"tunnel_active\":{},\"bunker_mode\":{},\"blocked_packets\":{}}}",
+        "{{\"tunnel_active\":{},\"bunker_mode\":{},\"blocked_packets\":{},\"direct_udp\":{}}}",
         TUNNEL_ACTIVE.load(Ordering::SeqCst),
         BUNKER_MODE.load(Ordering::SeqCst),
         BLOCKED_PACKETS.load(Ordering::SeqCst),
+        direct
     )
 }
 
 #[no_mangle]
-pub extern "C" fn nexomesh_init() {}
+pub extern "C" fn nexomesh_init() {
+    let _ = magic_dns();
+    let _ = acl_engine();
+    let _ = ffi_node();
+}
 
 #[no_mangle]
-pub extern "C" fn nexomesh_connect(_pubkey: *const c_char, _endpoint: *const c_char) -> i32 { 0 }
+pub extern "C" fn nexomesh_configure_session(
+    local_vip: *const c_char,
+    peer_vip: *const c_char,
+    local_key: *const c_char,
+    peer_key: *const c_char,
+    peer_endpoint: *const c_char,
+) -> i32 {
+    let lv = cstr_to_string(local_vip, "10.0.0.2");
+    let pv = cstr_to_string(peer_vip, "10.0.0.1");
+    let lk = cstr_to_string(local_key, "ios-local-key");
+    let pk = cstr_to_string(peer_key, "peer-key");
+    let ep = cstr_to_string(peer_endpoint, "");
+
+    if session::ensure_session(&pv, &lk, &pk).is_err() {
+        return -1;
+    }
+    let Ok(mut node) = derp::Node::bind(&lv, &pv, 0) else {
+        return -2;
+    };
+    if let Ok(addr) = ep.parse::<SocketAddr>() {
+        node.set_peer(addr);
+        let _ = node.start_noise_ik_handshake();
+    }
+    *ffi_node().lock().unwrap() = Some(node);
+    TUNNEL_ACTIVE.store(true, Ordering::SeqCst);
+    0
+}
 
 #[no_mangle]
-pub extern "C" fn nexomesh_disconnect() {}
+pub extern "C" fn nexomesh_connect(pubkey: *const c_char, endpoint: *const c_char) -> i32 {
+    let pk = cstr_to_string(pubkey, "peer-key");
+    let ep = cstr_to_string(endpoint, "");
+    let lv = CString::new("10.0.0.2").unwrap();
+    let pv = CString::new("10.0.0.1").unwrap();
+    let lk = CString::new("ios-local-key").unwrap();
+    let pk_c = CString::new(pk).unwrap();
+    let ep_c = CString::new(ep).unwrap();
+    nexomesh_configure_session(lv.as_ptr(), pv.as_ptr(), lk.as_ptr(), pk_c.as_ptr(), ep_c.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn nexomesh_push_outbound_ip(pkt: *const u8, pkt_len: i32) -> i32 {
+    if pkt.is_null() || pkt_len <= 0 || pkt_len > 65535 {
+        return -1;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(pkt, pkt_len as usize) };
+    let guard = ffi_node().lock().unwrap();
+    let Some(node) = guard.as_ref() else {
+        return -2;
+    };
+    if node.send_packet(slice).is_ok() { 0 } else { -3 }
+}
+
+#[no_mangle]
+pub extern "C" fn nexomesh_poll_inbound_ip(out: *mut u8, out_cap: i32) -> i32 {
+    if out.is_null() || out_cap <= 0 {
+        return -1;
+    }
+    let mut guard = ffi_node().lock().unwrap();
+    let Some(node) = guard.as_mut() else {
+        return -2;
+    };
+    node.tick();
+    match node.poll_udp_once() {
+        Ok(Some(derp::NodeEvent::Packet { packet, .. })) => {
+            if packet.len() > out_cap as usize {
+                return -3;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(packet.as_ptr(), out, packet.len());
+            }
+            packet.len() as i32
+        }
+        _ => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn nexomesh_rebind_network() -> i32 {
+    let mut guard = ffi_node().lock().unwrap();
+    let Some(node) = guard.as_mut() else {
+        return -1;
+    };
+    match node.rebind_udp() {
+        Ok(port) => port as i32,
+        Err(_) => -2,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn nexomesh_disconnect() {
+    TUNNEL_ACTIVE.store(false, Ordering::SeqCst);
+    *ffi_node().lock().unwrap() = None;
+}
 
 #[no_mangle]
 pub extern "C" fn nexomesh_status_json() -> *const c_char {
     let mut guard = LAST_STATUS.lock().unwrap();
     *guard = CString::new(status_json()).ok();
+    guard.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null())
+}
+
+#[no_mangle]
+pub extern "C" fn nexomesh_netcheck_json() -> *const c_char {
+    let json = ffi_node()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|n| n.netcheck_json(&[]))
+        .unwrap_or_else(status_json);
+    let mut guard = LAST_NETCHECK.lock().unwrap();
+    *guard = CString::new(json).ok();
     guard.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null())
 }
 
@@ -457,4 +587,59 @@ pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_finishPfsRekey(
         Ok(_) => 1,
         Err(_) => 0,
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_beginNoiseIkHandshake<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    peer_id: JString,
+) -> jni::objects::JByteArray<'a> {
+    let empty = env.byte_array_from_slice(&[]).unwrap_or(jni::objects::JByteArray::default());
+    let pid: String = match env.get_string(&peer_id) { Ok(s) => s.into(), Err(_) => return empty };
+    match session::begin_noise_ik_handshake(&pid) {
+        Ok(msg1) => env.byte_array_from_slice(&msg1).unwrap_or(empty),
+        Err(_) => empty,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_respondNoiseIkHandshake<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    peer_id: JString,
+    msg1: jni::objects::JByteArray,
+) -> jni::objects::JByteArray<'a> {
+    let empty = env.byte_array_from_slice(&[]).unwrap_or(jni::objects::JByteArray::default());
+    let pid: String = match env.get_string(&peer_id) { Ok(s) => s.into(), Err(_) => return empty };
+    let data: Vec<u8> = match env.convert_byte_array(msg1) { Ok(v) => v, Err(_) => return empty };
+    match session::respond_noise_ik_handshake(&pid, &data) {
+        Ok(msg2) => env.byte_array_from_slice(&msg2).unwrap_or(empty),
+        Err(_) => empty,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_completeNoiseIkHandshake(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id: JString,
+    msg2: jni::objects::JByteArray,
+) -> jboolean {
+    let pid: String = match env.get_string(&peer_id) { Ok(s) => s.into(), Err(_) => return 0 };
+    let data: Vec<u8> = match env.convert_byte_array(msg2) { Ok(v) => v, Err(_) => return 0 };
+    match session::complete_noise_ik_handshake(&pid, &data) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_isNoiseIkEstablished(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id: JString,
+) -> jboolean {
+    let pid: String = env.get_string(&peer_id).map(|s| s.into()).unwrap_or_default();
+    if session::is_noise_ik_established(&pid) { 1 } else { 0 }
 }

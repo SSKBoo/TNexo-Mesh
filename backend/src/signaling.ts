@@ -34,15 +34,34 @@ export function verifySignature(publicKey: string, nonce: string, signature: str
 }
 
 /**
- * Router multi-región para malla DERP distribuida: mantiene qué región DERP
- * sirve de Home DERP a cada nodo y reenvía frames NM2 entre regiones sin descifrar.
+ * Router multi-región para malla DERP distribuida (in-process y entre procesos HTTP/WS):
+ * mantiene qué región DERP sirve de Home DERP a cada nodo y reenvía frames NM2
+ * entre servidores DERP de distintas regiones sin descifrar.
  */
 export class DerpMeshRouter {
   private regions = new Map<number, SignalingHub>();
+  private remoteRegions = new Map<number, string>();
   private homeRegion = new Map<string, number>();
 
   attachRegion(regionId: number, hub: SignalingHub): void {
     this.regions.set(regionId, hub);
+  }
+
+  registerRemoteRegion(regionId: number, baseUrl: string): void {
+    this.remoteRegions.set(regionId, baseUrl.replace(/\/+$/, ""));
+  }
+
+  announceHome(peerKey: string, regionId: number): void {
+    this.homeRegion.set(peerKey, regionId);
+    for (const [remoteId, baseUrl] of this.remoteRegions) {
+      if (remoteId !== regionId) {
+        void fetch(`${baseUrl}/derp/mesh/announce`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ peerKey, regionId }),
+        }).catch(() => {});
+      }
+    }
   }
 
   setHomeRegion(peerKey: string, regionId: number): void {
@@ -51,6 +70,10 @@ export class DerpMeshRouter {
 
   getHomeRegion(peerKey: string): number | undefined {
     return this.homeRegion.get(peerKey);
+  }
+
+  snapshotHomes(): Record<string, number> {
+    return Object.fromEntries(this.homeRegion.entries());
   }
 
   removeHome(peerKey: string, regionId: number): void {
@@ -68,8 +91,17 @@ export class DerpMeshRouter {
     for (const candidate of targetKeys) {
       const targetRegionId = this.homeRegion.get(candidate);
       if (targetRegionId !== undefined && targetRegionId !== sourceRegionId) {
-        const remoteHub = this.regions.get(targetRegionId);
-        if (remoteHub && remoteHub.deliverFromRemoteRegion(from, candidate, payloadB64)) {
+        const localHub = this.regions.get(targetRegionId);
+        if (localHub && localHub.deliverFromRemoteRegion(from, candidate, payloadB64)) {
+          return true;
+        }
+        const remoteBase = this.remoteRegions.get(targetRegionId);
+        if (remoteBase) {
+          void fetch(`${remoteBase}/derp/mesh/deliver`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ from, targetKey: candidate, payloadB64 }),
+          }).catch(() => {});
           return true;
         }
       }
@@ -103,7 +135,7 @@ export class SignalingHub {
       }
     }
     this.peers.set(publicKey, { publicKey, socket, lastHeartbeat: Date.now() });
-    this.router?.setHomeRegion(publicKey, this.regionId);
+    this.router?.announceHome(publicKey, this.regionId);
     this.authority?.updateHomeDerp(publicKey, this.regionId);
     socket.on("close", () => this.remove(publicKey));
     socket.on("message", (raw: any) => this.handleMessage(publicKey, raw));
