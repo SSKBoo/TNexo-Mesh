@@ -10,3 +10,6 @@ qrcode = "0.14"
 
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

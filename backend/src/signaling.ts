@@ -48,6 +48,21 @@ export class SignalingHub {
   }
 
   private handleMessage(from: string, raw: any): void {
+    // Frame NM2 binario dirigido (DERP real): 'N','M','2' | dstKey(32 bytes) | payload.
+    // Se enruta ÚNICAMENTE al par destino (sin broadcast ni amplificación).
+    if (Buffer.isBuffer(raw) && raw.length >= 36 && raw[0] === 0x4e && raw[1] === 0x4d && raw[2] === 0x32) {
+      const dstBytes = raw.subarray(3, 35);
+      const dstB64 = dstBytes.toString("base64");
+      const dstHex = dstBytes.toString("hex");
+      const targetRec = this.peers.get(dstB64) ?? this.peers.get(dstHex);
+      if (targetRec) {
+        const inner = raw.subarray(35);
+        safeSend(targetRec.socket, JSON.stringify({ type: "relay", from, data: inner.toString("base64") }));
+      } else {
+        safeSend(this.peers.get(from)?.socket, JSON.stringify({ type: "error", payload: "target peer offline" }));
+      }
+      return;
+    }
     // Frame NM1 binario: primer byte 'N','M','1' y luego len(senderVip)|vip|ciphertext.
     // Lo reenviamos a TODOS los pares salvo el emisor (DERP-like), sin descifrar.
     if (Buffer.isBuffer(raw) && raw.length >= 6 && raw[0] === 0x4e && raw[1] === 0x4d && raw[2] === 0x31) {

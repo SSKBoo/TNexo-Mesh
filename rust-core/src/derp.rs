@@ -2,21 +2,50 @@
 //! reenvían por el WebSocket de señalización del backend (TLS/WSS en producción).
 //! El backend solo ve bytes cifrados en base64.
 
+use crate::nat;
 use crate::session;
 use anyhow::{anyhow, Result};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Región de relay DERP distribuida con latencia medida para selección automática.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerpRegion {
+    pub id: u16,
+    pub name: String,
+    pub endpoint: String,
+    pub rtt_ms: u32,
+}
+
+/// Selecciona la región DERP con menor RTT (excluyendo nodos caídos con `rtt_ms == u32::MAX`).
+pub fn select_nearest_derp_region(regions: &[DerpRegion]) -> Option<&DerpRegion> {
+    regions
+        .iter()
+        .filter(|r| r.rtt_ms < u32::MAX && !r.endpoint.is_empty())
+        .min_by_key(|r| r.rtt_ms)
+}
+
+/// Construye frame DERP dirigido sin broadcast: `NM2 | dst_pubkey(32B) | nm1_frame`.
+pub fn build_nm2_routed_frame(dst_pubkey: &[u8; 32], nm1_frame: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(3 + 32 + nm1_frame.len());
+    out.extend_from_slice(b"NM2");
+    out.extend_from_slice(dst_pubkey);
+    out.extend_from_slice(nm1_frame);
+    out
+}
 
 #[derive(Debug)]
 pub enum NodeEvent {
     Hello { vip: String, name: String, from: SocketAddr },
     Ack { vip: String, from: SocketAddr },
+    DiscoPing { vip: String, tx_id: u64, from: SocketAddr },
+    DiscoPong { vip: String, tx_id: u64, from: SocketAddr },
     Packet { sender_vip: String, packet: Vec<u8> },
 }
 
-/// Cliente userspace del túnel: intenta UDP directo y cae al relay.
+/// Cliente userspace del túnel: intenta UDP directo, sondeo Disco y cae al relay DERP.
 pub struct Node {
     pub local_vip: String,
     pub peer_vip: String,
@@ -24,6 +53,9 @@ pub struct Node {
     peer_addr: Option<SocketAddr>,
     relay_tx: Option<Sender<Vec<u8>>>,
     direct_ok: Arc<Mutex<bool>>,
+    last_direct_rx: Arc<Mutex<Option<Instant>>>,
+    pending_disco: Mutex<Option<(u64, Instant)>>,
+    disco_rtt_ms: Arc<Mutex<Option<u32>>>,
 }
 
 impl Node {
@@ -37,6 +69,9 @@ impl Node {
             peer_addr: None,
             relay_tx: None,
             direct_ok: Arc::new(Mutex::new(false)),
+            last_direct_rx: Arc::new(Mutex::new(None)),
+            pending_disco: Mutex::new(None),
+            disco_rtt_ms: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -102,7 +137,51 @@ impl Node {
         Ok(())
     }
 
-    /// Lee un datagrama UDP (con timeout de 50ms) y procesa `NM_HELLO`, `NM_ACK` o `NM1`.
+    /// Envía una sonda Disco `NM_DISCO_PING|<tx_id>|<local_vip>` para promoción en caliente DERP -> P2P.
+    pub fn send_disco_ping(&self, tx_id: u64) -> Result<()> {
+        if let Some(addr) = self.peer_addr {
+            *self.pending_disco.lock().unwrap() = Some((tx_id, Instant::now()));
+            let msg = format!("NM_DISCO_PING|{tx_id}|{}", self.local_vip);
+            self.sock.send_to(msg.as_bytes(), addr)?;
+        }
+        Ok(())
+    }
+
+    /// Evasión de NAT simétrico (Birthday Paradox): dispara sondas Disco desde 32 sockets efímeros.
+    pub fn probe_symmetric_nat(
+        &self,
+        peer_ip: Ipv4Addr,
+        base_port: u16,
+        port_spread: u16,
+        tx_id: u64,
+    ) -> usize {
+        let sockets = nat::bind_birthday_sockets(32);
+        let msg = format!("NM_DISCO_PING|{tx_id}|{}", self.local_vip);
+        nat::spray_birthday_probes(&sockets, peer_ip, base_port, port_spread, msg.as_bytes())
+    }
+
+    /// Si el camino UDP directo dejó de responder durante `stale_after`, degrada a DERP sin cortar flujo.
+    pub fn fallback_to_relay_if_stale(&self, stale_after: Duration) -> bool {
+        let mut direct = self.direct_ok.lock().unwrap();
+        if !*direct {
+            return false;
+        }
+        let stale = match *self.last_direct_rx.lock().unwrap() {
+            Some(ts) => ts.elapsed() > stale_after,
+            None => true,
+        };
+        if stale {
+            *direct = false;
+            return true;
+        }
+        false
+    }
+
+    pub fn last_disco_rtt_ms(&self) -> Option<u32> {
+        *self.disco_rtt_ms.lock().unwrap()
+    }
+
+    /// Lee un datagrama UDP (con timeout de 50ms) y procesa `NM_HELLO`, `NM_ACK`, `NM_DISCO_*` o `NM1`.
     pub fn poll_udp_once(&mut self) -> Result<Option<NodeEvent>> {
         let mut buf = [0u8; 4200];
         let (len, from) = match self.sock.recv_from(&mut buf) {
@@ -128,6 +207,7 @@ impl Node {
             if vip.starts_with("10.0.0.") && vip != self.local_vip {
                 self.peer_addr = Some(from);
                 *self.direct_ok.lock().unwrap() = true;
+                *self.last_direct_rx.lock().unwrap() = Some(Instant::now());
                 let ack = format!("NM_ACK|{}|rust-cli|direct", self.local_vip);
                 let _ = self.sock.send_to(ack.as_bytes(), from);
                 return Ok(Some(NodeEvent::Hello { vip, name, from }));
@@ -143,7 +223,46 @@ impl Node {
             if vip.starts_with("10.0.0.") && vip != self.local_vip {
                 self.peer_addr = Some(from);
                 *self.direct_ok.lock().unwrap() = true;
+                *self.last_direct_rx.lock().unwrap() = Some(Instant::now());
                 return Ok(Some(NodeEvent::Ack { vip, from }));
+            }
+            return Ok(None);
+        }
+
+        if pkt.starts_with(b"NM_DISCO_PING|") {
+            let text = String::from_utf8_lossy(pkt);
+            let mut parts = text.split('|');
+            let _ = parts.next();
+            let tx_id = parts.next().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+            let vip = parts.next().unwrap_or("").trim().to_string();
+            if vip.starts_with("10.0.0.") && vip != self.local_vip {
+                self.peer_addr = Some(from);
+                *self.direct_ok.lock().unwrap() = true;
+                *self.last_direct_rx.lock().unwrap() = Some(Instant::now());
+                let pong = format!("NM_DISCO_PONG|{tx_id}|{}", self.local_vip);
+                let _ = self.sock.send_to(pong.as_bytes(), from);
+                return Ok(Some(NodeEvent::DiscoPing { vip, tx_id, from }));
+            }
+            return Ok(None);
+        }
+
+        if pkt.starts_with(b"NM_DISCO_PONG|") {
+            let text = String::from_utf8_lossy(pkt);
+            let mut parts = text.split('|');
+            let _ = parts.next();
+            let tx_id = parts.next().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+            let vip = parts.next().unwrap_or("").trim().to_string();
+            if vip.starts_with("10.0.0.") && vip != self.local_vip {
+                self.peer_addr = Some(from);
+                *self.direct_ok.lock().unwrap() = true;
+                *self.last_direct_rx.lock().unwrap() = Some(Instant::now());
+                if let Some((pending_id, started)) = *self.pending_disco.lock().unwrap() {
+                    if pending_id == tx_id {
+                        *self.disco_rtt_ms.lock().unwrap() =
+                            Some(started.elapsed().as_millis().min(u32::MAX as u128) as u32);
+                    }
+                }
+                return Ok(Some(NodeEvent::DiscoPong { vip, tx_id, from }));
             }
             return Ok(None);
         }
@@ -152,6 +271,7 @@ impl Node {
             if let Ok((sender_vip, packet)) = Self::parse_nm1_frame(pkt) {
                 self.peer_addr = Some(from);
                 *self.direct_ok.lock().unwrap() = true;
+                *self.last_direct_rx.lock().unwrap() = Some(Instant::now());
                 return Ok(Some(NodeEvent::Packet { sender_vip, packet }));
             }
         }

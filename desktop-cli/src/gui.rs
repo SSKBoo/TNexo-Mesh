@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 use crate::{handle_incoming_file_conn, probe_stun, send_bytes_p2p};
 #[cfg(target_os = "windows")]
 use crate::win_tun;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::unix_tun;
 
 struct GuiState {
     receiver_active: bool,
@@ -42,6 +44,8 @@ struct GuiState {
     ping_seq: u16,
     #[cfg(target_os = "windows")]
     tun_session: Option<Arc<wintun::Session>>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    unix_tun: Option<Arc<unix_tun::UnixTun>>,
 }
 
 fn load_or_create_key(cfg_path: &Path) -> String {
@@ -133,6 +137,8 @@ pub fn run_gui() {
         ping_seq: 0,
         #[cfg(target_os = "windows")]
         tun_session: None,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unix_tun: None,
     }));
 
     let listener = TcpListener::bind("127.0.0.1:51822")
@@ -313,6 +319,10 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<GuiState>>) {
             if let Some(sess) = g.tun_session.take() {
                 let _ = sess.shutdown();
             }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                g.unix_tun = None;
+            }
             g.events.insert(0, "⏹️ Túnel detenido".to_string());
             write_http(&mut stream, "200 OK", "application/json", b"{\"ok\":true}");
         }
@@ -483,6 +493,42 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
         }
     };
 
+    // Levantar adaptador TUN nativo en Linux (/dev/net/tun) o macOS (utun)
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let _unix_tun_guard = match unix_tun::UnixTun::open(&local_vip) {
+        Ok(tun) => {
+            let tun_arc = Arc::new(tun);
+            let iface_name = tun_arc.name.clone();
+            {
+                let mut g = state.lock().unwrap();
+                g.tun_adapter_active = true;
+                g.unix_tun = Some(Arc::clone(&tun_arc));
+                g.events.insert(0, format!("🛡️ Adaptador TUN {iface_name} activo ({local_vip}/24)"));
+            }
+            let st_tun = Arc::clone(&state);
+            let tun_rx = Arc::clone(&tun_arc);
+            let tun_local_vip = local_vip.clone();
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while st_tun.lock().unwrap().tunnel_active {
+                    if let Some(bytes) = tun_rx.read_packet(&mut buf) {
+                        if bytes.len() >= 20 && (bytes[0] >> 4) == 4 {
+                            let dst = format!("{}.{}.{}.{}", bytes[16], bytes[17], bytes[18], bytes[19]);
+                            if dst.starts_with("10.0.0.") && dst != tun_local_vip {
+                                st_tun.lock().unwrap().outbound_packets.push(bytes);
+                            }
+                        }
+                    }
+                }
+            });
+            Some(tun_arc)
+        }
+        Err(msg) => {
+            state.lock().unwrap().events.insert(0, format!("ℹ️ {msg}"));
+            None
+        }
+    };
+
     let mut node = match Node::bind(&local_vip, &peer_vip, 51820).or_else(|_| Node::bind(&local_vip, &peer_vip, 0)) {
         Ok(n) => n,
         Err(e) => {
@@ -575,7 +621,10 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
 
         if let Ok(Some(ev)) = node.poll_udp_once() {
             match ev {
-                NodeEvent::Hello { vip, .. } | NodeEvent::Ack { vip, .. } => {
+                NodeEvent::Hello { vip, .. }
+                | NodeEvent::Ack { vip, .. }
+                | NodeEvent::DiscoPing { vip, .. }
+                | NodeEvent::DiscoPong { vip, .. } => {
                     let mut g = state.lock().unwrap();
                     if !g.direct_udp {
                         g.direct_udp = true;
@@ -641,10 +690,14 @@ fn handle_tunnel_payload(
         return;
     }
 
-    // Si el adaptador VPN Windows (Wintun) está activo, inyectar el paquete IPv4 al sistema operativo
+    // Si el adaptador VPN está activo (Windows Wintun o Linux/macOS TUN), inyectar IPv4 al SO
     #[cfg(target_os = "windows")]
     if let Some(sess) = state.lock().unwrap().tun_session.as_ref().cloned() {
         win_tun::write_ip_packet(&sess, packet);
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(tun) = state.lock().unwrap().unix_tun.as_ref().cloned() {
+        let _ = tun.write_packet(packet);
     }
 
     if packet.len() >= 28 && (packet[0] >> 4) == 4 && packet[9] == 1 {

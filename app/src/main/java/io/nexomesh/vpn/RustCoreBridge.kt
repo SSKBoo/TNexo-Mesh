@@ -29,4 +29,10 @@ object RustCoreBridge {
     // Firma Ed25519 para challenge-response de señalización/relay
     external fun getSigningPublicKey(seed: String): String
     external fun signChallenge(seed: String, nonce: String): String
+
+    // MagicDNS local (.mesh) + Motor ACL por nodo
+    external fun registerMagicDnsHost(name: String, ipv4: String)
+    external fun resolveMagicDnsPacket(query: ByteArray): ByteArray
+    external fun addAclRule(allow: Boolean, srcCidr: String, dstCidr: String, ipProto: Int, dstPort: Int)
+    external fun checkAclPacket(srcIp: String, dstIp: String, ipProto: Int, dstPort: Int): Boolean
 }

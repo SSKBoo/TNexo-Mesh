@@ -22,6 +22,19 @@ use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use std::sync::{Mutex, OnceLock};
+
+static MAGIC_DNS: OnceLock<Mutex<magic_dns::MagicDns>> = OnceLock::new();
+static ACL_ENGINE: OnceLock<Mutex<acl::AclEngine>> = OnceLock::new();
+
+fn magic_dns() -> &'static Mutex<magic_dns::MagicDns> {
+    MAGIC_DNS.get_or_init(|| Mutex::new(magic_dns::MagicDns::new()))
+}
+
+fn acl_engine() -> &'static Mutex<acl::AclEngine> {
+    ACL_ENGINE.get_or_init(|| Mutex::new(acl::AclEngine::new(acl::Action::Allow)))
+}
+
 static TUNNEL_ACTIVE: AtomicBool = AtomicBool::new(false);
 static BUNKER_MODE: AtomicBool = AtomicBool::new(false);
 static BLOCKED_PACKETS: AtomicU64 = AtomicU64::new(0);
@@ -305,4 +318,95 @@ pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_signChallenge(
     env.new_string(sig_b64)
         .expect("Couldn't create java string")
         .into_raw()
+}
+
+// ---------------------------------------------------------------------------
+// JNI: MagicDNS embebido + Motor de politicas ACL
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_registerMagicDnsHost(
+    mut env: JNIEnv,
+    _class: JClass,
+    name: JString,
+    ipv4: JString,
+) {
+    let host: String = env.get_string(&name).map(|v| v.into()).unwrap_or_default();
+    let ip_str: String = env.get_string(&ipv4).map(|v| v.into()).unwrap_or_default();
+    if let Ok(v4) = ip_str.parse::<Ipv4Addr>() {
+        if !host.trim().is_empty() {
+            magic_dns().lock().unwrap().register(&host, v4, None);
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_resolveMagicDnsPacket<'a>(
+    env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    query: jni::objects::JByteArray,
+) -> jni::objects::JByteArray<'a> {
+    let empty = env.byte_array_from_slice(&[]).unwrap_or(jni::objects::JByteArray::default());
+    let req: Vec<u8> = match env.convert_byte_array(query) {
+        Ok(v) => v,
+        Err(_) => return empty,
+    };
+    let guard = magic_dns().lock().unwrap();
+    match guard.handle_dns_query(&req) {
+        Some(resp) => env.byte_array_from_slice(&resp).unwrap_or(empty),
+        None => empty,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_addAclRule(
+    mut env: JNIEnv,
+    _class: JClass,
+    allow: jboolean,
+    src_cidr: JString,
+    dst_cidr: JString,
+    ip_proto: jint,
+    dst_port: jint,
+) {
+    let src: String = env.get_string(&src_cidr).map(|v| v.into()).unwrap_or_else(|_| "0.0.0.0/0".into());
+    let dst: String = env.get_string(&dst_cidr).map(|v| v.into()).unwrap_or_else(|_| "0.0.0.0/0".into());
+    let proto = if ip_proto <= 0 {
+        acl::Proto::Any
+    } else {
+        acl::Proto::from_ip_proto(ip_proto as u8)
+    };
+    let port = if dst_port > 0 && dst_port <= 65535 {
+        Some(dst_port as u16)
+    } else {
+        None
+    };
+    acl_engine().lock().unwrap().add_rule(acl::AclRule {
+        action: if allow != 0 { acl::Action::Allow } else { acl::Action::Deny },
+        src_cidr: src,
+        dst_cidr: dst,
+        proto,
+        dst_port: port,
+    });
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_checkAclPacket(
+    mut env: JNIEnv,
+    _class: JClass,
+    src_ip: JString,
+    dst_ip: JString,
+    ip_proto: jint,
+    dst_port: jint,
+) -> jboolean {
+    let s_str: String = env.get_string(&src_ip).map(|v| v.into()).unwrap_or_default();
+    let d_str: String = env.get_string(&dst_ip).map(|v| v.into()).unwrap_or_default();
+    let (Ok(src), Ok(dst)) = (s_str.parse::<Ipv4Addr>(), d_str.parse::<Ipv4Addr>()) else {
+        return 1;
+    };
+    let port = dst_port.clamp(0, 65535) as u16;
+    let action = acl_engine()
+        .lock()
+        .unwrap()
+        .evaluate(src, dst, ip_proto.clamp(0, 255) as u8, port);
+    if action == acl::Action::Allow { 1 } else { 0 }
 }

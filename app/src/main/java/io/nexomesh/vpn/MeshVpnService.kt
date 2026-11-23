@@ -194,6 +194,8 @@ class MeshVpnService : VpnService() {
     private var serviceNetworkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile
     private var forwardRunning = false
+    @Volatile
+    private var hasExtraRoutes = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "STOP") {
@@ -234,15 +236,43 @@ class MeshVpnService : VpnService() {
         ensureNotification(localIp)
         acquireWakeLock()
 
-        // Split-tunnel puro para 10.0.0.0/24: NO sobreescribimos DNS (addDnsServer) ni agregamos
-        // addDisallowedApplication(packageName), así nuestros sockets P2P a 10.0.0.x SÍ pasan
-        // por tun0, mientras todo Internet/DNS sale directo por Wi-Fi / 4G / Ethernet.
+        // Split-tunnel + MagicDNS (10.0.0.53) + Subnet Routers / Exit Node + exclusión por app
         val builder = Builder()
             .setSession("NexoMesh P2P")
             .addAddress(localIp, 24)
             .addRoute("10.0.0.0", 24)
             .setMtu(mtu)
             .setBlocking(true)
+
+        if (prefs.getBoolean("magic_dns_enabled", true)) {
+            builder.addDnsServer("10.0.0.53")
+        }
+        val subnetRoutes = (intent?.getStringExtra("SUBNET_ROUTES")
+            ?: prefs.getString("subnet_routes", "") ?: "")
+            .split(",")
+            .map { it.trim() }
+            .filter { it.contains("/") }
+        for (cidr in subnetRoutes) {
+            val parts = cidr.split("/")
+            val net = parts.getOrNull(0)?.trim() ?: continue
+            val prefix = parts.getOrNull(1)?.trim()?.toIntOrNull() ?: continue
+            try { builder.addRoute(net, prefix) } catch (_: Exception) {}
+        }
+        val exitNode = intent?.getBooleanExtra("EXIT_NODE", false) == true ||
+            prefs.getBoolean("exit_node_enabled", false)
+        if (exitNode) {
+            try { builder.addRoute("0.0.0.0", 0) } catch (_: Exception) {}
+        }
+        hasExtraRoutes = exitNode || subnetRoutes.isNotEmpty()
+        prefs.getStringSet("excluded_apps", emptySet())?.forEach { pkg ->
+            if (pkg.isNotBlank() && pkg != packageName) {
+                try { builder.addDisallowedApplication(pkg) } catch (_: Exception) {}
+            }
+        }
+        if (RustCoreBridge.isNativeReady()) {
+            RustCoreBridge.registerMagicDnsHost("self", localIp)
+            RustCoreBridge.registerMagicDnsHost(Build.MODEL, localIp)
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             builder.setMetered(false)
@@ -378,34 +408,58 @@ class MeshVpnService : VpnService() {
                     if (len < 20 || ((buf[0].toInt() ushr 4) and 0x0F) != 4) continue
                     val srcIp = "${buf[12].toInt() and 0xFF}.${buf[13].toInt() and 0xFF}.${buf[14].toInt() and 0xFF}.${buf[15].toInt() and 0xFF}"
                     val dstIp = "${buf[16].toInt() and 0xFF}.${buf[17].toInt() and 0xFF}.${buf[18].toInt() and 0xFF}.${buf[19].toInt() and 0xFF}"
-                    if (!dstIp.startsWith("10.0.0.") || dstIp == localIp) continue
-                    if (quarantinedIps.contains(dstIp) || quarantinedIps.contains(srcIp)) {
-                        blockedPacketsCount += 1L
-                        continue
-                    }
                     val proto = buf[9].toInt() and 0xFF
                     val ihl = (buf[0].toInt() and 0x0F) * 4
                     val dstPort = if ((proto == 6 || proto == 17) && len >= ihl + 4) {
                         ((buf[ihl + 2].toInt() and 0xFF) shl 8) or (buf[ihl + 3].toInt() and 0xFF)
                     } else 51820
 
+                    // MagicDNS embebido (.mesh) + Split-DNS transparente hacia upstream físico
+                    if (proto == 17 && dstIp == "10.0.0.53" && dstPort == 53 && len > ihl + 8) {
+                        val dnsReq = buf.copyOfRange(ihl + 8, len)
+                        val reqCopy = buf.copyOfRange(0, len)
+                        val localResp = if (RustCoreBridge.isNativeReady()) {
+                            RustCoreBridge.resolveMagicDnsPacket(dnsReq)
+                        } else ByteArray(0)
+                        if (localResp.isNotEmpty()) {
+                            buildIpv4UdpReply(reqCopy, len, localResp)?.let { reply ->
+                                synchronized(lockWrite) { tunOut.write(reply, 0, reply.size) }
+                            }
+                        } else {
+                            forwardSplitDnsAsync(dnsReq, reqCopy, len, tunOut, lockWrite)
+                        }
+                        continue
+                    }
+
+                    val targetVip = if (dstIp.startsWith("10.0.0.")) dstIp
+                    else if (hasExtraRoutes) peerRoutes.keys.firstOrNull { it != localIp } ?: ""
+                    else ""
+                    if (targetVip.isEmpty() || dstIp == localIp) continue
+                    if (quarantinedIps.contains(dstIp) || quarantinedIps.contains(srcIp)) {
+                        blockedPacketsCount += 1L
+                        continue
+                    }
+
                     if (dstPort in listOf(22, 23, 445, 3389, 5555) || (bunkerMode && dstPort != 51820 && dstPort != 51821)) {
                         blockedPacketsCount += 1L
                         continue
                     }
-                    if (RustCoreBridge.isNativeReady() && !RustCoreBridge.inspectPacket(len, dstPort)) {
-                        blockedPacketsCount += 1L
-                        continue
+                    if (RustCoreBridge.isNativeReady()) {
+                        if (!RustCoreBridge.inspectPacket(len, dstPort) ||
+                            !RustCoreBridge.checkAclPacket(srcIp, dstIp, proto, dstPort)) {
+                            blockedPacketsCount += 1L
+                            continue
+                        }
                     }
 
                     // frame: NM1 | len(senderVip) | senderVip | ciphertext(AEAD)
                     val senderBytes = localIp.toByteArray(Charsets.UTF_8)
                     val packet = buf.copyOfRange(0, len)
                     val encrypted = if (RustCoreBridge.isNativeReady()) {
-                        RustCoreBridge.sealPacket(dstIp, packet)
+                        RustCoreBridge.sealPacket(targetVip, packet)
                     } else packet
                     if (encrypted.isEmpty()) {
-                        android.util.Log.w("NexoMeshRelay", "sealPacket vacío para $dstIp (sin sesión)")
+                        android.util.Log.w("NexoMeshRelay", "sealPacket vacío para $targetVip (sin sesión)")
                         continue
                     }
                     val frame = ByteArray(4 + senderBytes.size + encrypted.size)
@@ -417,11 +471,11 @@ class MeshVpnService : VpnService() {
                     System.arraycopy(encrypted, 0, frame, 4 + senderBytes.size, encrypted.size)
 
                     val sock = udpSocket ?: continue
-                    // Directo UDP solo si hubo tráfico/ACK reciente (<15s); si no,
+                    // Directo UDP solo si hubo tráfico/ACK/Disco reciente (<15s); si no,
                     // usar relay WSS (tipo Tailscale DERP) mientras sigue el hole-punch.
-                    val directFresh = learnedSocketAddrs[dstIp] != null &&
-                        (System.currentTimeMillis() - (lastDirectRxMs[dstIp] ?: 0L)) <= 15_000L
-                    val target = resolveBestPeerTarget(dstIp, localIp)
+                    val directFresh = learnedSocketAddrs[targetVip] != null &&
+                        (System.currentTimeMillis() - (lastDirectRxMs[targetVip] ?: 0L)) <= 15_000L
+                    val target = resolveBestPeerTarget(targetVip, localIp)
                     var sent = false
                     if (directFresh && target != null) {
                         try {
@@ -471,7 +525,21 @@ class MeshVpnService : VpnService() {
                     }
                     if (rxBuf[0] == 'N'.code.toByte() && rxBuf[1] == 'M'.code.toByte() && rxBuf[2] == '_'.code.toByte()) {
                         val msg = String(rxBuf, 0, len, Charsets.UTF_8)
-                        if (msg.startsWith("NM_HELLO|") || msg.startsWith("NM_ACK|")) {
+                        if (msg.startsWith("NM_DISCO_PING|") || msg.startsWith("NM_DISCO_PONG|")) {
+                            val parts = msg.split("|")
+                            val txId = parts.getOrNull(1)?.trim() ?: "0"
+                            val peerVip = parts.getOrNull(2)?.trim() ?: ""
+                            if (peerVip.startsWith("10.0.0.") && peerVip != localIp && pkt.address != null) {
+                                learnedSocketAddrs[peerVip] = InetSocketAddress(pkt.address, pkt.port)
+                                lastDirectRxMs[peerVip] = System.currentTimeMillis()
+                                if (msg.startsWith("NM_DISCO_PING|")) {
+                                    val pong = "NM_DISCO_PONG|$txId|$localIp".toByteArray(Charsets.UTF_8)
+                                    try { sock.send(DatagramPacket(pong, pong.size, pkt.address, pkt.port)) } catch (_: Exception) {}
+                                } else {
+                                    recordAckReceived(peerVip)
+                                }
+                            }
+                        } else if (msg.startsWith("NM_HELLO|") || msg.startsWith("NM_ACK|")) {
                             val parts = msg.split("|")
                             val peerVip = parts.getOrNull(1)?.trim() ?: ""
                             val peerName = parts.getOrNull(2)?.trim() ?: "Par P2P"
@@ -481,6 +549,9 @@ class MeshVpnService : VpnService() {
                                 val remote = InetSocketAddress(pkt.address, pkt.port)
                                 learnedSocketAddrs[peerVip] = remote
                                 lastDirectRxMs[peerVip] = System.currentTimeMillis()
+                                if (RustCoreBridge.isNativeReady()) {
+                                    RustCoreBridge.registerMagicDnsHost(peerName, peerVip)
+                                }
                                 if (peerPk.isNotBlank()) {
                                     getSharedPreferences("nexomesh_prefs", MODE_PRIVATE).edit()
                                         .putString("peer_pk_$peerVip", peerPk)
@@ -567,10 +638,12 @@ class MeshVpnService : VpnService() {
                     val sock = udpSocket
                     if (sock != null) {
                         val hello = "NM_HELLO|$localIp|${Build.MODEL}|keepalive|$localPublicKey".toByteArray(Charsets.UTF_8)
+                        val disco = "NM_DISCO_PING|${System.currentTimeMillis()}|$localIp".toByteArray(Charsets.UTF_8)
                         for (peer in peerRoutes.values) {
                             for (target in resolvePeerTargets(peer.virtualIp)) {
                                 try {
                                     sock.send(DatagramPacket(hello, hello.size, target.address, target.port))
+                                    sock.send(DatagramPacket(disco, disco.size, target.address, target.port))
                                     recordHelloSent(peer.virtualIp)
                                 } catch (_: Exception) {
                                 }
@@ -693,14 +766,91 @@ class MeshVpnService : VpnService() {
             }
             val sock = udpSocket ?: return@Thread
             val hello = "NM_HELLO|$localVirtualIp|${Build.MODEL}|disco|$localPublicKey".toByteArray(Charsets.UTF_8)
+            val disco = "NM_DISCO_PING|${System.currentTimeMillis()}|$localVirtualIp".toByteArray(Charsets.UTF_8)
             for (peer in peerRoutes.values) {
                 for (target in resolvePeerTargets(peer.virtualIp)) {
                     try {
                         sock.send(DatagramPacket(hello, hello.size, target.address, target.port))
+                        sock.send(DatagramPacket(disco, disco.size, target.address, target.port))
                         recordHelloSent(peer.virtualIp)
                     } catch (_: Exception) {
                     }
                 }
+            }
+        }.start()
+    }
+
+    private fun buildIpv4UdpReply(reqPacket: ByteArray, reqLen: Int, payload: ByteArray): ByteArray? {
+        if (reqLen < 28) return null
+        val ihl = (reqPacket[0].toInt() and 0x0F) * 4
+        if (ihl < 20 || reqLen < ihl + 8) return null
+        val totalLen = 20 + 8 + payload.size
+        val out = ByteArray(totalLen)
+        out[0] = 0x45
+        out[2] = (totalLen ushr 8).toByte()
+        out[3] = totalLen.toByte()
+        out[6] = 0x40 // Don't fragment
+        out[8] = 64   // TTL
+        out[9] = 17   // UDP
+        // Swap src <-> dst IPv4
+        System.arraycopy(reqPacket, 16, out, 12, 4)
+        System.arraycopy(reqPacket, 12, out, 16, 4)
+        var sum = 0
+        for (i in 0 until 20 step 2) {
+            sum += ((out[i].toInt() and 0xFF) shl 8) or (out[i + 1].toInt() and 0xFF)
+        }
+        while ((sum ushr 16) != 0) sum = (sum and 0xFFFF) + (sum ushr 16)
+        val csum = sum.inv() and 0xFFFF
+        out[10] = (csum ushr 8).toByte()
+        out[11] = csum.toByte()
+        // Swap UDP ports
+        out[20] = reqPacket[ihl + 2]; out[21] = reqPacket[ihl + 3]
+        out[22] = reqPacket[ihl]; out[23] = reqPacket[ihl + 1]
+        val udpLen = 8 + payload.size
+        out[24] = (udpLen ushr 8).toByte()
+        out[25] = udpLen.toByte()
+        System.arraycopy(payload, 0, out, 28, payload.size)
+        return out
+    }
+
+    private fun findUpstreamDnsAddress(): InetAddress {
+        try {
+            val cm = getSystemService(ConnectivityManager::class.java)
+            if (cm != null) {
+                for (net in findUnderlyingPhysicalNetworks()) {
+                    val lp = cm.getLinkProperties(net) ?: continue
+                    val v4 = lp.dnsServers.firstOrNull { it is java.net.Inet4Address }
+                    if (v4 != null) return v4
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return InetAddress.getByName("8.8.8.8")
+    }
+
+    private fun forwardSplitDnsAsync(
+        dnsReq: ByteArray,
+        reqCopy: ByteArray,
+        reqLen: Int,
+        tunOut: FileOutputStream,
+        lockWrite: Any,
+    ) {
+        Thread {
+            try {
+                DatagramSocket().use { s ->
+                    protect(s)
+                    s.soTimeout = 1500
+                    val upstream = findUpstreamDnsAddress()
+                    s.send(DatagramPacket(dnsReq, dnsReq.size, upstream, 53))
+                    val respBuf = ByteArray(1500)
+                    val respPkt = DatagramPacket(respBuf, respBuf.size)
+                    s.receive(respPkt)
+                    val payload = respBuf.copyOfRange(0, respPkt.length)
+                    buildIpv4UdpReply(reqCopy, reqLen, payload)?.let { ipReply ->
+                        synchronized(lockWrite) { tunOut.write(ipReply, 0, ipReply.size) }
+                    }
+                }
+            } catch (_: Exception) {
             }
         }.start()
     }

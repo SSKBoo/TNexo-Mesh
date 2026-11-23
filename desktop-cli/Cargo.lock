@@ -514,6 +514,7 @@ dependencies = [
 name = "nexomesh-cli"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "nexomesh_core",
  "qrcode",
  "snow",

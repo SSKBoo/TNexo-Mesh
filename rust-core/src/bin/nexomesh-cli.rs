@@ -195,6 +195,12 @@ fn run_tunnel(args: &[String]) {
             Ok(Some(NodeEvent::Ack { vip, from })) => {
                 println!("[DIRECT UDP] NM_ACK confirmado con {vip} en {from}");
             }
+            Ok(Some(NodeEvent::DiscoPing { vip, tx_id, from })) => {
+                println!("[DISCO] Ping #{tx_id} de {vip} en {from}");
+            }
+            Ok(Some(NodeEvent::DiscoPong { vip, tx_id, from })) => {
+                println!("[DISCO] Pong #{tx_id} de {vip} en {from} -> enlace directo activo");
+            }
             Ok(Some(NodeEvent::Packet { sender_vip, packet })) => {
                 handle_decrypted_packet(&node, &local, &sender_vip, &packet, "DIRECT UDP", &mut ping_sent_at);
             }
