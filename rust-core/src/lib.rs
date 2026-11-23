@@ -410,3 +410,51 @@ pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_checkAclPacket(
         .evaluate(src, dst, ip_proto.clamp(0, 255) as u8, port);
     if action == acl::Action::Allow { 1 } else { 0 }
 }
+
+// ---------------------------------------------------------------------------
+// JNI: rotación automática PFS (ephemeral X25519 rekeying)
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_needsRekey(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id: JString,
+) -> jboolean {
+    let pid: String = env.get_string(&peer_id).map(|s| s.into()).unwrap_or_default();
+    if session::needs_rekey(&pid) { 1 } else { 0 }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_beginPfsRekey<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    peer_id: JString,
+) -> jni::objects::JByteArray<'a> {
+    let empty = env.byte_array_from_slice(&[]).unwrap_or(jni::objects::JByteArray::default());
+    let pid: String = match env.get_string(&peer_id) { Ok(s) => s.into(), Err(_) => return empty };
+    match session::begin_pfs_rekey(&pid) {
+        Ok(pub_key) => env.byte_array_from_slice(&pub_key).unwrap_or(empty),
+        Err(_) => empty,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_finishPfsRekey(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id: JString,
+    peer_eph_pub: jni::objects::JByteArray,
+) -> jboolean {
+    let pid: String = match env.get_string(&peer_id) { Ok(s) => s.into(), Err(_) => return 0 };
+    let pub_vec: Vec<u8> = match env.convert_byte_array(peer_eph_pub) { Ok(v) => v, Err(_) => return 0 };
+    if pub_vec.len() != 32 {
+        return 0;
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&pub_vec);
+    match session::finish_pfs_rekey(&pid, &arr) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
+}

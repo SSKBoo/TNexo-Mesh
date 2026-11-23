@@ -3,6 +3,7 @@ use nexomesh_core::derp::{
     build_icmp_echo_request, try_build_icmp_echo_reply, Node, NodeEvent,
 };
 use nexomesh_core::keys::{sign_challenge_b64, signing_public_key_b64};
+use nexomesh_core::magic_dns::{spawn_split_dns_server, MagicDns};
 use nexomesh_core::session;
 use nexomesh_core::ws_client::{
     base64_decode, base64_encode, extract_json_str, WsClient, WsFrame,
@@ -11,9 +12,10 @@ use qrcode::render::svg;
 use qrcode::QrCode;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -318,10 +320,13 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<GuiState>>) {
             #[cfg(target_os = "windows")]
             if let Some(sess) = g.tun_session.take() {
                 let _ = sess.shutdown();
+                win_tun::restore_windows_split_dns();
             }
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
-                g.unix_tun = None;
+                if let Some(tun) = g.unix_tun.take() {
+                    unix_tun::restore_unix_split_dns(&tun.name);
+                }
             }
             g.events.insert(0, "⏹️ Túnel detenido".to_string());
             write_http(&mut stream, "200 OK", "application/json", b"{\"ok\":true}");
@@ -460,6 +465,20 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
         return;
     }
 
+    // Iniciar resolver local Split-DNS (*.nexomesh / *.mesh) y registrarlo en el SO
+    let mut mdns = MagicDns::new();
+    if let Ok(lv4) = local_vip.parse::<Ipv4Addr>() {
+        mdns.register("self", lv4, None);
+    }
+    if let Ok(pv4) = peer_vip.parse::<Ipv4Addr>() {
+        mdns.register("peer", pv4, None);
+    }
+    let dns_stop_flag = spawn_split_dns_server("10.0.0.53:53", "1.1.1.1:53", Arc::new(Mutex::new(mdns)))
+        .ok()
+        .map(|(_, flag)| flag);
+    #[cfg(target_os = "windows")]
+    win_tun::configure_windows_split_dns("10.0.0.53");
+
     // Intentar levantar adaptador VPN real en Windows (Wintun) si existe wintun.dll y hay permisos Admin
     #[cfg(target_os = "windows")]
     let _wintun_guard = match win_tun::try_start_wintun(&local_vip) {
@@ -497,6 +516,7 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let _unix_tun_guard = match unix_tun::UnixTun::open(&local_vip) {
         Ok(tun) => {
+            unix_tun::configure_unix_split_dns(&tun.name, "10.0.0.53");
             let tun_arc = Arc::new(tun);
             let iface_name = tun_arc.name.clone();
             {
@@ -541,6 +561,14 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
     if let Ok(addr) = peer_ep.parse::<SocketAddr>() {
         node.set_peer(addr);
     }
+    let peer_sign_b64 = signing_public_key_b64(&effective_peer_key);
+    if let Ok(pk_raw) = base64_decode(&peer_sign_b64) {
+        if pk_raw.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&pk_raw);
+            node.set_relay_target_signing_key(arr);
+        }
+    }
 
     let relay_rx = if !relay_url.is_empty() {
         Some(node.enable_relay())
@@ -551,7 +579,8 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
     let mut ws: Option<WsClient> = if !relay_url.is_empty() {
         match WsClient::connect(&relay_url) {
             Ok(mut client) => {
-                let mut reg_id = format!("pc-{local_vip}");
+                let (sign_pub, bind_sig) = sign_challenge_b64(&local_key, &format!("bind:{local_key}"));
+                let mut reg_id = sign_pub;
                 let mut sig = String::new();
                 if let Ok(Some(WsFrame::Text(first))) = client.recv_frame() {
                     if extract_json_str(&first, "type").as_deref() == Some("challenge") {
@@ -563,9 +592,13 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
                     }
                 }
                 let reg = if sig.is_empty() {
-                    format!(r#"{{"type":"register","from":"{reg_id}"}}"#)
+                    format!(
+                        r#"{{"type":"register","from":"{reg_id}","nodeKey":"{local_key}","bindingSignature":"{bind_sig}"}}"#
+                    )
                 } else {
-                    format!(r#"{{"type":"register","from":"{reg_id}","signature":"{sig}"}}"#)
+                    format!(
+                        r#"{{"type":"register","from":"{reg_id}","signature":"{sig}","nodeKey":"{local_key}","bindingSignature":"{bind_sig}"}}"#
+                    )
                 };
                 if client.send_text(&reg).is_ok() {
                     let mut g = state.lock().unwrap();
@@ -589,7 +622,19 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
     let mut last_hb = Instant::now();
     loop {
         if !state.lock().unwrap().tunnel_active {
+            if let Some(flag) = &dns_stop_flag {
+                flag.store(false, Ordering::Relaxed);
+            }
             break;
+        }
+        node.tick();
+        {
+            let mut g = state.lock().unwrap();
+            let direct_now = node.using_direct();
+            if g.direct_udp && !direct_now {
+                g.direct_udp = false;
+                g.events.insert(0, "🔁 Degradado a relay DERP NM2 (P2P sin respuesta)".to_string());
+            }
         }
         if last_hello.elapsed() >= Duration::from_secs(5) {
             let _ = node.send_hello("NexoMesh-PC");
@@ -631,6 +676,9 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
                         g.events.insert(0, format!("⚡ UDP directo confirmado con {vip}"));
                     }
                 }
+                NodeEvent::Rekeyed { vip } => {
+                    state.lock().unwrap().events.insert(0, format!("🔐 Clave PFS rotada con {vip}"));
+                }
                 NodeEvent::Packet { sender_vip, packet } => {
                     handle_tunnel_payload(&node, &local_vip, &sender_vip, &packet, "UDP", &state);
                 }
@@ -643,8 +691,14 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
                     if extract_json_str(&txt, "type").as_deref() == Some("relay") {
                         if let Some(b64) = extract_json_str(&txt, "data") {
                             if let Ok(frame) = base64_decode(&b64) {
-                                if let Ok((svip, pkt)) = Node::parse_nm1_frame(&frame) {
-                                    handle_tunnel_payload(&node, &local_vip, &svip, &pkt, "RELAY", &state);
+                                match node.feed_relay_event(&frame) {
+                                    Ok(Some(NodeEvent::Packet { sender_vip, packet })) => {
+                                        handle_tunnel_payload(&node, &local_vip, &sender_vip, &packet, "RELAY", &state);
+                                    }
+                                    Ok(Some(NodeEvent::Rekeyed { vip })) => {
+                                        state.lock().unwrap().events.insert(0, format!("🔐 Clave PFS rotada vía DERP con {vip}"));
+                                    }
+                                    _ => {}
                                 }
                             }
                         }

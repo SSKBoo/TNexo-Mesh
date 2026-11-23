@@ -1,9 +1,6 @@
 package io.nexomesh.vpn
 
 import android.util.Log
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -14,8 +11,8 @@ import org.json.JSONObject
 import java.util.Base64
 
 /**
- * Cliente de relay tipo DERP: envía frames NM1 cifrados por WSS al backend de
- * señalización cuando el UDP directo falla. El backend nunca ve el payload en claro.
+ * Cliente DERP dirigido (NM2 / relay `to`): vincula nodeKey + signingKey
+ * en el handshake de señalización y nunca hace broadcast sin destinatario.
  */
 object RelayClient {
     private const val TAG = "NexoMeshRelay"
@@ -30,13 +27,15 @@ object RelayClient {
     var onFrameReceived: ((ByteArray) -> Unit)? = null
 
     fun connect(url: String, signingIdentity: String, signature: String) {
-        connect(url, signingIdentity, signature, null)
+        connect(url, signingIdentity, signature, "", "", null)
     }
 
     fun connect(
         url: String,
         signingIdentity: String,
         fallbackSignature: String = "",
+        nodeKey: String = "",
+        bindingSignature: String = "",
         signNonce: ((String) -> String)? = null
     ) {
         if (url.isBlank()) return
@@ -51,6 +50,10 @@ object RelayClient {
                         put("type", "register")
                         put("from", signingIdentity)
                         put("signature", fallbackSignature)
+                        if (nodeKey.isNotBlank() && bindingSignature.isNotBlank()) {
+                            put("nodeKey", nodeKey)
+                            put("bindingSignature", bindingSignature)
+                        }
                     }.toString())
                     connected = true
                     Log.i(TAG, "relay WS conectado (sin challenge)")
@@ -68,9 +71,13 @@ object RelayClient {
                                 put("type", "register")
                                 put("from", signingIdentity)
                                 put("signature", sig)
+                                if (nodeKey.isNotBlank() && bindingSignature.isNotBlank()) {
+                                    put("nodeKey", nodeKey)
+                                    put("bindingSignature", bindingSignature)
+                                }
                             }.toString())
                             connected = true
-                            Log.i(TAG, "relay WS registrado tras challenge")
+                            Log.i(TAG, "relay WS registrado con identidad vinculada")
                         }
                         "relay" -> {
                             val data = Base64.getDecoder().decode(msg.optString("data"))
@@ -84,7 +91,7 @@ object RelayClient {
 
             override fun onMessage(ws: WebSocket, bytes: ByteString) {
                 val raw = bytes.toByteArray()
-                if (raw.size >= 6 && raw[0] == 'N'.code.toByte() && raw[1] == 'M'.code.toByte() && raw[2] == '1'.code.toByte()) {
+                if (raw.size >= 6) {
                     onFrameReceived?.invoke(raw)
                 }
             }
@@ -100,14 +107,30 @@ object RelayClient {
         })
     }
 
-    fun send(frame: ByteArray): Boolean {
-        if (!connected || socket == null) return false
+    /** Envía frame dirigido como binario NM2 (32B dstKey + payload) o JSON `relay` con `to` explícito. */
+    fun send(frame: ByteArray, targetSigningKey: String = ""): Boolean {
+        val ws = socket
+        if (!connected || ws == null || targetSigningKey.isBlank()) return false
+        try {
+            val dstRaw = Base64.getDecoder().decode(targetSigningKey)
+            if (dstRaw.size == 32) {
+                val nm2 = ByteArray(3 + 32 + frame.size)
+                nm2[0] = 'N'.code.toByte()
+                nm2[1] = 'M'.code.toByte()
+                nm2[2] = '2'.code.toByte()
+                System.arraycopy(dstRaw, 0, nm2, 3, 32)
+                System.arraycopy(frame, 0, nm2, 35, frame.size)
+                return ws.send(ByteString.of(*nm2))
+            }
+        } catch (_: Exception) {
+        }
         val json = JSONObject().apply {
             put("type", "relay")
             put("from", identity)
+            put("to", targetSigningKey)
             put("data", Base64.getEncoder().encodeToString(frame))
         }.toString()
-        return socket!!.send(json)
+        return ws.send(json)
     }
 
     fun isConnected(): Boolean = connected

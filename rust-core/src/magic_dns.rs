@@ -2,7 +2,10 @@
 //! simples registrados en la malla) a sus IPs virtuales `10.0.0.x` o `fd7a:...`.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct DnsRecord {
@@ -24,8 +27,9 @@ impl MagicDns {
     pub fn register(&mut self, name: &str, ipv4: Ipv4Addr, ipv6: Option<Ipv6Addr>) {
         let norm = normalize_name(name);
         self.records.insert(norm.clone(), DnsRecord { ipv4, ipv6 });
-        if !norm.ends_with(".mesh") {
+        if !norm.ends_with(".mesh") && !norm.ends_with(".nexomesh") {
             self.records.insert(format!("{norm}.mesh"), DnsRecord { ipv4, ipv6 });
+            self.records.insert(format!("{norm}.nexomesh"), DnsRecord { ipv4, ipv6 });
         }
     }
 
@@ -118,4 +122,45 @@ fn parse_qname(buf: &[u8], mut idx: usize) -> Option<(String, usize)> {
         idx += len;
     }
     Some((labels.join("."), idx))
+}
+
+/// Inicia un resolver UDP Split-DNS local: responde `*.nexomesh` / `*.mesh` en memoria
+/// y reenvía el resto de consultas DNS al upstream habitual sin romper Internet.
+pub fn spawn_split_dns_server(
+    bind_addr: &str,
+    upstream_dns: &str,
+    dns: Arc<Mutex<MagicDns>>,
+) -> std::io::Result<(SocketAddr, Arc<AtomicBool>)> {
+    let sock = UdpSocket::bind(bind_addr)?;
+    sock.set_read_timeout(Some(Duration::from_millis(200)))?;
+    let local_addr = sock.local_addr()?;
+    let running = Arc::new(AtomicBool::new(true));
+    let running_bg = Arc::clone(&running);
+    let upstream = upstream_dns.to_string();
+
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1500];
+        let mut up_buf = [0u8; 1500];
+        while running_bg.load(Ordering::Relaxed) {
+            let Ok((n, client_addr)) = sock.recv_from(&mut buf) else {
+                continue;
+            };
+            let req = &buf[..n];
+            let local_resp = dns.lock().unwrap().handle_dns_query(req);
+            if let Some(resp) = local_resp {
+                let _ = sock.send_to(&resp, client_addr);
+                continue;
+            }
+            if let Ok(up_sock) = UdpSocket::bind("0.0.0.0:0") {
+                let _ = up_sock.set_read_timeout(Some(Duration::from_millis(1200)));
+                if up_sock.send_to(req, &upstream).is_ok() {
+                    if let Ok((rn, _)) = up_sock.recv_from(&mut up_buf) {
+                        let _ = sock.send_to(&up_buf[..rn], client_addr);
+                    }
+                }
+            }
+        }
+    });
+
+    Ok((local_addr, running))
 }

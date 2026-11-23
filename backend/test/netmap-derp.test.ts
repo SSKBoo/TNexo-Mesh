@@ -1,8 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import { createServer } from "node:http";
+import WebSocket from "ws";
 import { NetMapAuthority, verifyIdentityBinding, verifySignedNetMap } from "../src/netmap.ts";
-import { SignalingHub } from "../src/signaling.ts";
+import { attachSignalingToHttpServer, DerpMeshRouter, SignalingHub } from "../src/signaling.ts";
+import { Store } from "../src/store.ts";
 
 class FakeSocket {
   sent: string[] = [];
@@ -82,4 +85,111 @@ test("NetMapAuthority verifica vínculo X25519<->Ed25519, aprobación, expiraci�
 
   // Expiración de llave
   assert.equal(auth.isActiveAndApproved(id.pubB64, Date.now() + 30 * 24 * 60 * 60 * 1000), false);
+});
+
+test("Malla multi-región DERP enruta NM2 entre región 1 y región 2 y persiste NetMap", () => {
+  const store = new Store(":memory:");
+  const auth = new NetMapAuthority(store);
+  const a = genEd();
+  const b = genEd();
+  auth.registerNode(
+    { nodeKey: "NODE_A", signingKey: a.pubB64, userId: "a@mesh", virtualIp: "10.0.0.2", approved: true, homeDerp: 1, endpoints: [], subnets: [] },
+    a.sign("bind:NODE_A")
+  );
+  auth.registerNode(
+    { nodeKey: "NODE_B", signingKey: b.pubB64, userId: "b@mesh", virtualIp: "10.0.0.3", approved: true, homeDerp: 2, endpoints: [], subnets: [] },
+    b.sign("bind:NODE_B")
+  );
+
+  // Simular reinicio del plano de control cargando desde el mismo Store SQLite
+  const restartedAuth = new NetMapAuthority(store);
+  assert.equal(restartedAuth.isActiveAndApproved(a.pubB64), true);
+  assert.equal(restartedAuth.isActiveAndApproved(b.pubB64), true);
+
+  const router = new DerpMeshRouter();
+  const hub1 = new SignalingHub(1, router, restartedAuth);
+  const hub2 = new SignalingHub(2, router, restartedAuth);
+  const sa = new FakeSocket();
+  const sb = new FakeSocket();
+  hub1.register(a.pubB64, sa as any);
+  hub2.register(b.pubB64, sb as any);
+  sa.sent.length = 0;
+  sb.sent.length = 0;
+
+  const payload = Buffer.from("ENCRYPTED_PACKET");
+  const nm2 = Buffer.concat([Buffer.from("NM2"), b.pubRaw, payload]);
+  sa.emit("message", nm2);
+
+  assert.equal(sb.sent.length, 1, "B en región 2 debe recibir el frame NM2 originado en región 1");
+  const msg = JSON.parse(sb.sent[0]);
+  assert.equal(msg.type, "relay");
+  assert.equal(msg.from, a.pubB64);
+  assert.equal(msg.viaRegion, 2);
+  assert.equal(Buffer.from(msg.data, "base64").toString("hex"), payload.toString("hex"));
+});
+
+test("WS register exige firma válida, vínculo X25519<->Ed25519 y aprobación en NetMapAuthority", async () => {
+  const store = new Store(":memory:");
+  const auth = new NetMapAuthority(store);
+  const dev = genEd();
+  auth.registerNode(
+    { nodeKey: "X25519_DEV", signingKey: dev.pubB64, userId: "dev@mesh", virtualIp: "10.0.0.4", approved: false, endpoints: [], subnets: [] },
+    dev.sign("bind:X25519_DEV")
+  );
+
+  const server = createServer((_req, res) => { res.writeHead(200); res.end("ok"); });
+  const hub = new SignalingHub(1, undefined, auth);
+  const wss = attachSignalingToHttpServer(server, true, () => true, hub, "/ws", auth);
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const addr = server.address() as { port: number };
+  const url = `ws://127.0.0.1:${addr.port}/ws`;
+
+  // 1. No aprobado aún -> rechazado en handshake WS
+  const ws1 = new WebSocket(url);
+  const msg1: any[] = [];
+  await new Promise<void>((resolve) => {
+    ws1.on("message", (raw) => {
+      const m = JSON.parse(String(raw));
+      msg1.push(m);
+      if (m.type === "challenge") {
+        ws1.send(JSON.stringify({
+          type: "register",
+          from: dev.pubB64,
+          signature: dev.sign(m.nonce),
+          nodeKey: "X25519_DEV",
+          bindingSignature: dev.sign("bind:X25519_DEV"),
+        }));
+      } else if (m.type === "error") {
+        resolve();
+      }
+    });
+  });
+  assert.ok(msg1.some((m) => m.type === "error" && String(m.payload).includes("unapproved")));
+  ws1.close();
+
+  // 2. Aprobar dispositivo -> WS registra y devuelve SignedNetMap
+  auth.approveDevice(dev.pubB64, true);
+  const ws2 = new WebSocket(url);
+  const netmapMsg: any = await new Promise((resolve) => {
+    ws2.on("message", (raw) => {
+      const m = JSON.parse(String(raw));
+      if (m.type === "challenge") {
+        ws2.send(JSON.stringify({
+          type: "register",
+          from: dev.pubB64,
+          signature: dev.sign(m.nonce),
+          nodeKey: "X25519_DEV",
+          bindingSignature: dev.sign("bind:X25519_DEV"),
+        }));
+      } else if (m.type === "netmap") {
+        resolve(m);
+      }
+    });
+  });
+  assert.equal(verifySignedNetMap(netmapMsg.netmap), true);
+  assert.equal(netmapMsg.netmap.payload.nodes.length, 1);
+
+  ws2.close();
+  wss.close();
+  await new Promise<void>((r) => server.close(() => r()));
 });

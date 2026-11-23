@@ -79,3 +79,23 @@ pub fn write_ip_packet(session: &Arc<Session>, ip_packet: &[u8]) {
         session.send_packet(pkt);
     }
 }
+
+/// Registra Split DNS en Windows vía NRPT para `.nexomesh` y `.mesh` apuntando al resolver local.
+pub fn configure_windows_split_dns(dns_server: &str) {
+    let ps = format!(
+        "Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq 'NexoMesh' }} | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue; \
+         Add-DnsClientNrptRule -Namespace '.nexomesh' -NameServers '{dns_server}' -Comment 'NexoMesh' -ErrorAction SilentlyContinue; \
+         Add-DnsClientNrptRule -Namespace '.mesh' -NameServers '{dns_server}' -Comment 'NexoMesh' -ErrorAction SilentlyContinue"
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps])
+        .status();
+}
+
+/// Elimina las reglas NRPT de NexoMesh al detener el túnel VPN en Windows.
+pub fn restore_windows_split_dns() {
+    let ps = "Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'NexoMesh' } | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue";
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", ps])
+        .status();
+}

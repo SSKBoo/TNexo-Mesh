@@ -287,3 +287,51 @@ pub fn enable_exit_node_nat(wan_iface: &str, mesh_cidr: &str) -> Result<(), Stri
     }
     Ok(())
 }
+
+/// Configura Split DNS (`~nexomesh`, `~mesh`) en `systemd-resolved` (Linux) o `/etc/resolver` + `scutil` (macOS).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn configure_unix_split_dns(iface: &str, dns_server: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let ok_res = Command::new("resolvectl").args(["dns", iface, dns_server]).status();
+        if matches!(ok_res, Ok(s) if s.success()) {
+            let _ = Command::new("resolvectl")
+                .args(["domain", iface, "~nexomesh", "~mesh"])
+                .status();
+        } else if let Ok(orig) = std::fs::read_to_string("/etc/resolv.conf") {
+            if !orig.contains("# NexoMesh SplitDNS") {
+                let _ = std::fs::write("/etc/resolv.conf.nexomesh.bak", &orig);
+                let patched = format!("nameserver {dns_server} # NexoMesh SplitDNS\n{orig}");
+                let _ = std::fs::write("/etc/resolv.conf", patched);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::fs::create_dir_all("/etc/resolver");
+        let content = format!("nameserver {dns_server}\n");
+        let _ = std::fs::write("/etc/resolver/nexomesh", &content);
+        let _ = std::fs::write("/etc/resolver/mesh", &content);
+        let _ = Command::new("killall").args(["-HUP", "mDNSResponder"]).status();
+    }
+}
+
+/// Limpia la configuración Split DNS en Linux/macOS al apagar la VPN.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn restore_unix_split_dns(iface: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("resolvectl").args(["revert", iface]).status();
+        if let Ok(bak) = std::fs::read_to_string("/etc/resolv.conf.nexomesh.bak") {
+            let _ = std::fs::write("/etc/resolv.conf", bak);
+            let _ = std::fs::remove_file("/etc/resolv.conf.nexomesh.bak");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = iface;
+        let _ = std::fs::remove_file("/etc/resolver/nexomesh");
+        let _ = std::fs::remove_file("/etc/resolver/mesh");
+        let _ = Command::new("killall").args(["-HUP", "mDNSResponder"]).status();
+    }
+}

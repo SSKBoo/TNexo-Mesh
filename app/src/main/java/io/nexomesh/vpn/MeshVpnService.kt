@@ -246,6 +246,7 @@ class MeshVpnService : VpnService() {
 
         if (prefs.getBoolean("magic_dns_enabled", true)) {
             builder.addDnsServer("10.0.0.53")
+            builder.addSearchDomain("nexomesh")
         }
         val subnetRoutes = (intent?.getStringExtra("SUBNET_ROUTES")
             ?: prefs.getString("subnet_routes", "") ?: "")
@@ -315,7 +316,8 @@ class MeshVpnService : VpnService() {
             val seed = localPublicKey.ifBlank { localIp }
             if (RustCoreBridge.isNativeReady()) {
                 val signingPub = RustCoreBridge.getSigningPublicKey(seed)
-                RelayClient.connect(relayUrl, signingPub, "") { nonce ->
+                val bindSig = RustCoreBridge.signChallenge(seed, "bind:$seed")
+                RelayClient.connect(relayUrl, signingPub, "", seed, bindSig) { nonce ->
                     RustCoreBridge.signChallenge(seed, nonce)
                 }
             } else {
@@ -486,8 +488,14 @@ class MeshVpnService : VpnService() {
                         }
                     }
                     if (!sent && RelayClient.isConnected()) {
-                        // Fallback DERP: UDP directo no confirmado -> relay WSS
-                        if (RelayClient.send(frame)) {
+                        // Fallback DERP dirigido (NM2): UDP directo no confirmado -> relay WSS
+                        val peerSeed = peerRoutes[targetVip]?.peerPublicKey
+                            ?: getSharedPreferences("nexomesh_prefs", MODE_PRIVATE).getString("peer_pk_$targetVip", "")
+                            ?: ""
+                        val targetSigningKey = if (RustCoreBridge.isNativeReady() && peerSeed.isNotBlank()) {
+                            RustCoreBridge.getSigningPublicKey(peerSeed)
+                        } else targetVip
+                        if (RelayClient.send(frame, targetSigningKey)) {
                             addTxBytes(len)
                             sent = true
                         }
@@ -505,13 +513,17 @@ class MeshVpnService : VpnService() {
             }
         }.apply { name = "NexoMesh-TunToUdp"; start() }
 
-        // 2. UDP (:51820) -> TUN inyector IPv4 + receptor NM_HELLO
+        // 2. UDP (:51820) -> TUN inyector IPv4 + receptor NM_HELLO / Disco / Rekey
         Thread {
             val rxBuf = ByteArray(4200)
             while (forwardRunning) {
                 try {
                     val pkt = DatagramPacket(rxBuf, rxBuf.size)
-                    val sock = udpSocket ?: break
+                    val sock = udpSocket
+                    if (sock == null) {
+                        Thread.sleep(40)
+                        continue
+                    }
                     sock.receive(pkt)
                     val len = pkt.length
                     if (len < 8) continue
@@ -525,7 +537,29 @@ class MeshVpnService : VpnService() {
                     }
                     if (rxBuf[0] == 'N'.code.toByte() && rxBuf[1] == 'M'.code.toByte() && rxBuf[2] == '_'.code.toByte()) {
                         val msg = String(rxBuf, 0, len, Charsets.UTF_8)
-                        if (msg.startsWith("NM_DISCO_PING|") || msg.startsWith("NM_DISCO_PONG|")) {
+                        if (msg.startsWith("NM_REKEY_INIT|") || msg.startsWith("NM_REKEY_ACK|")) {
+                            val parts = msg.split("|")
+                            val peerVip = parts.getOrNull(1)?.trim() ?: ""
+                            val b64 = parts.getOrNull(2)?.trim() ?: ""
+                            if (peerVip.startsWith("10.0.0.") && peerVip != localIp && RustCoreBridge.isNativeReady()) {
+                                try {
+                                    val peerEph = java.util.Base64.getDecoder().decode(b64)
+                                    if (peerEph.size == 32) {
+                                        if (msg.startsWith("NM_REKEY_INIT|")) {
+                                            val ourEph = RustCoreBridge.beginPfsRekey(peerVip)
+                                            if (ourEph.size == 32) {
+                                                val ackMsg = "NM_REKEY_ACK|$localIp|${java.util.Base64.getEncoder().encodeToString(ourEph)}".toByteArray(Charsets.UTF_8)
+                                                sock.send(DatagramPacket(ackMsg, ackMsg.size, pkt.address, pkt.port))
+                                                RustCoreBridge.finishPfsRekey(peerVip, peerEph)
+                                            }
+                                        } else {
+                                            RustCoreBridge.finishPfsRekey(peerVip, peerEph)
+                                        }
+                                    }
+                                } catch (_: Exception) {
+                                }
+                            }
+                        } else if (msg.startsWith("NM_DISCO_PING|") || msg.startsWith("NM_DISCO_PONG|")) {
                             val parts = msg.split("|")
                             val txId = parts.getOrNull(1)?.trim() ?: "0"
                             val peerVip = parts.getOrNull(2)?.trim() ?: ""
@@ -640,6 +674,15 @@ class MeshVpnService : VpnService() {
                         val hello = "NM_HELLO|$localIp|${Build.MODEL}|keepalive|$localPublicKey".toByteArray(Charsets.UTF_8)
                         val disco = "NM_DISCO_PING|${System.currentTimeMillis()}|$localIp".toByteArray(Charsets.UTF_8)
                         for (peer in peerRoutes.values) {
+                            if (RustCoreBridge.isNativeReady() && RustCoreBridge.needsRekey(peer.virtualIp)) {
+                                val ourEph = RustCoreBridge.beginPfsRekey(peer.virtualIp)
+                                if (ourEph.size == 32) {
+                                    val rekeyMsg = "NM_REKEY_INIT|$localIp|${java.util.Base64.getEncoder().encodeToString(ourEph)}".toByteArray(Charsets.UTF_8)
+                                    resolvePeerTargets(peer.virtualIp).firstOrNull()?.let { target ->
+                                        try { sock.send(DatagramPacket(rekeyMsg, rekeyMsg.size, target.address, target.port)) } catch (_: Exception) {}
+                                    }
+                                }
+                            }
                             for (target in resolvePeerTargets(peer.virtualIp)) {
                                 try {
                                     sock.send(DatagramPacket(hello, hello.size, target.address, target.port))
@@ -757,6 +800,8 @@ class MeshVpnService : VpnService() {
             } catch (_: Exception) {
             }
         }
+        // Socket rebinding automático en Android al cambiar Wi-Fi <-> 4G/5G
+        rebindProtectedUdpSocket()
         // Invalidar frescura UDP para caer de inmediato a Relay mientras Disco sondea la nueva red
         lastDirectRxMs.clear()
         Thread {
@@ -853,6 +898,26 @@ class MeshVpnService : VpnService() {
             } catch (_: Exception) {
             }
         }.start()
+    }
+
+    private fun rebindProtectedUdpSocket() {
+        try {
+            val oldSock = udpSocket
+            val fresh = DatagramSocket(null).apply {
+                reuseAddress = true
+                try {
+                    bind(InetSocketAddress(MESH_UDP_PORT))
+                } catch (_: Exception) {
+                    bind(InetSocketAddress(0))
+                }
+            }
+            protect(fresh)
+            udpSocket = fresh
+            activeUdpSocket = fresh
+            try { oldSock?.close() } catch (_: Exception) {}
+            android.util.Log.i("NexoMeshVpn", "Socket UDP re-vinculado a puerto ${fresh.localPort} tras cambio de red")
+        } catch (_: Exception) {
+        }
     }
 
     private fun stopForwardLoops() {

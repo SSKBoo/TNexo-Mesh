@@ -1,9 +1,9 @@
 use nexomesh_core::derp::{
-    build_icmp_echo_request, build_nm2_routed_frame, select_nearest_derp_region,
-    try_build_icmp_echo_reply, DerpRegion, Node, NodeEvent,
+    build_icmp_echo_request, build_nm2_routed_frame, probe_derp_regions,
+    select_nearest_derp_region, try_build_icmp_echo_reply, DerpRegion, Node, NodeEvent, RouteKind,
 };
 use nexomesh_core::session;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::time::Duration;
 
 #[test]
@@ -151,4 +151,108 @@ fn symmetric_nat_probe_sprays_birthday_sockets() {
     let port_b = node_b.local_port().unwrap();
     let sent = node_a.probe_symmetric_nat(Ipv4Addr::LOCALHOST, port_b, 4, 77);
     assert_eq!(sent, 32);
+}
+
+#[test]
+fn magicsock_probes_candidates_and_selects_lowest_rtt_route() {
+    let mut node_a = Node::bind("10.0.0.40", "10.0.0.41", 0).unwrap();
+    let mut node_b = Node::bind("10.0.0.41", "10.0.0.40", 0).unwrap();
+
+    let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let live_addr: SocketAddr = format!("127.0.0.1:{}", node_b.local_port().unwrap()).parse().unwrap();
+    node_a.set_peer(dead_addr);
+    node_a.add_candidate(dead_addr, RouteKind::StunPublic);
+    node_a.add_candidate(live_addr, RouteKind::Lan);
+
+    let probed = node_a.probe_candidates();
+    assert_eq!(probed, 2);
+
+    // B recibe NM_DISCO_PING en su socket real y responde NM_DISCO_PONG
+    match node_b.poll_udp_once().unwrap() {
+        Some(NodeEvent::DiscoPing { vip, .. }) => assert_eq!(vip, "10.0.0.40"),
+        other => panic!("esperaba DiscoPing en B, obtuve {other:?}"),
+    }
+    match node_a.poll_udp_once().unwrap() {
+        Some(NodeEvent::DiscoPong { vip, from, .. }) => {
+            assert_eq!(vip, "10.0.0.41");
+            assert_eq!(from, live_addr);
+        }
+        other => panic!("esperaba DiscoPong en A, obtuve {other:?}"),
+    }
+    assert_eq!(node_a.peer_addr(), Some(live_addr), "magicsock debe promover la ruta directa viva");
+    assert!(node_a.using_direct());
+}
+
+#[test]
+fn automatic_tick_triggers_pfs_rekey_and_continues_encrypted_traffic() {
+    session::ensure_session("10.0.0.50", "AUTO_B", "AUTO_A").unwrap();
+    session::ensure_session("10.0.0.51", "AUTO_A", "AUTO_B").unwrap();
+
+    let mut node_a = Node::bind("10.0.0.50", "10.0.0.51", 0).unwrap();
+    let mut node_b = Node::bind("10.0.0.51", "10.0.0.50", 0).unwrap();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", node_a.local_port().unwrap()).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", node_b.local_port().unwrap()).parse().unwrap();
+    node_a.set_peer(addr_b);
+    node_b.set_peer(addr_a);
+
+    // Programar rekey inmediato en el par "10.0.0.51" de A y dejar que tick() lo ejecute automáticamente
+    session::schedule_rekey_now("10.0.0.51");
+    assert!(session::needs_rekey("10.0.0.51"));
+    node_a.tick();
+
+    // B recibe DiscoPing y luego NM_REKEY_INIT -> rota y responde NM_REKEY_ACK
+    loop {
+        match node_b.poll_udp_once().unwrap() {
+            Some(NodeEvent::Rekeyed { vip }) => {
+                assert_eq!(vip, "10.0.0.50");
+                break;
+            }
+            Some(NodeEvent::DiscoPing { .. }) | Some(NodeEvent::DiscoPong { .. }) => continue,
+            other => panic!("esperaba Rekeyed en B, obtuve {other:?}"),
+        }
+    }
+    // A recibe NM_REKEY_ACK y completa finish_pfs_rekey
+    loop {
+        match node_a.poll_udp_once().unwrap() {
+            Some(NodeEvent::Rekeyed { vip }) => {
+                assert_eq!(vip, "10.0.0.51");
+                break;
+            }
+            Some(NodeEvent::DiscoPing { .. }) | Some(NodeEvent::DiscoPong { .. }) => continue,
+            other => panic!("esperaba Rekeyed en A, obtuve {other:?}"),
+        }
+    }
+    assert!(!session::needs_rekey("10.0.0.51"), "después de rotar, el contador y timer se reinician");
+
+    // Verificar que el tráfico IP cifrado funciona con la nueva clave PFS
+    let pkt = build_icmp_echo_request("10.0.0.50", "10.0.0.51", 42).unwrap();
+    node_a.send_packet(&pkt).unwrap();
+    loop {
+        match node_b.poll_udp_once().unwrap() {
+            Some(NodeEvent::Packet { sender_vip, packet }) => {
+                assert_eq!(sender_vip, "10.0.0.50");
+                assert_eq!(packet, pkt);
+                break;
+            }
+            Some(NodeEvent::DiscoPong { .. }) | Some(NodeEvent::DiscoPing { .. }) => continue,
+            other => panic!("esperaba Packet cifrado post-rekey en B, obtuve {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn derp_region_tcp_prober_selects_reachable_lowest_rtt() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let live_port = listener.local_addr().unwrap().port();
+    let _accept_bg = std::thread::spawn(move || {
+        let _ = listener.accept();
+    });
+
+    let mut regions = vec![
+        DerpRegion { id: 1, name: "dead".into(), endpoint: "ws://127.0.0.1:1/ws".into(), rtt_ms: 0 },
+        DerpRegion { id: 2, name: "live".into(), endpoint: format!("ws://127.0.0.1:{live_port}/ws"), rtt_ms: 999 },
+    ];
+    probe_derp_regions(&mut regions);
+    let best = select_nearest_derp_region(&regions).expect("debe elegir región viva");
+    assert_eq!(best.id, 2);
 }

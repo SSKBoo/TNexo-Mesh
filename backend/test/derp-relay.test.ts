@@ -13,50 +13,46 @@ class FakeSocket {
   emit(ev: string, ...a: any[]) { this.handlers[ev]?.(...a); }
 }
 
-test("DERP-like relay reenvía frame NM1 binario sin descifrar", () => {
+test("DERP rechaza broadcast NM1 inseguro y exige NM2 dirigido", () => {
   const hub = new SignalingHub();
   const a = new FakeSocket();
   const b = new FakeSocket();
   hub.register("peerA", a as any);
   hub.register("peerB", b as any);
+  a.sent.length = 0;
+  b.sent.length = 0;
 
-  // NM1 | len=8 | 10.0.0.2 | ciphertext simulado
   const vip = Buffer.from("10.0.0.2");
-  const frame = Buffer.concat([Buffer.from([0x4e, 0x4d, 0x31, vip.length]), vip, Buffer.from("CIPHERTEXT")]);
+  const nm1 = Buffer.concat([Buffer.from([0x4e, 0x4d, 0x31, vip.length]), vip, Buffer.from("CIPHERTEXT")]);
+  a.emit("message", nm1);
 
-  // Emitir como Buffer (ws entrega binarios así)
-  a.emit("message", frame);
-
-  assert.equal(b.sent.length, 1, "B debe recibir el relay");
-  const msg = JSON.parse(b.sent[0]);
-  assert.equal(msg.type, "relay");
-  assert.equal(msg.from, "peerA");
-  assert.equal(Buffer.from(msg.data, "base64").toString("hex"), frame.toString("hex"));
-  const aRelays = a.sent.filter((s) => { try { return JSON.parse(s).type === "relay"; } catch { return false; } });
-  assert.equal(aRelays.length, 0, "el emisor no debe recibir su propio frame relay");
-  assert.ok(!b.sent[0].includes("CIPHERTEXT"), "el payload viaja en base64, no en claro");
+  assert.equal(b.sent.length, 0, "NM1 no debe hacerse broadcast a B");
+  const err = JSON.parse(a.sent[0]);
+  assert.equal(err.type, "error");
+  assert.ok(String(err.payload).includes("nm1 broadcast rejected"));
 });
 
-test("JSON relay sin `to` y list-peers funcionan para RelayClient", () => {
+test("JSON relay exige destinatario `to` y rechaza broadcast sin `to`", () => {
   const hub = new SignalingHub();
   const a = new FakeSocket();
   const b = new FakeSocket();
   hub.register("peerA", a as any);
   hub.register("peerB", b as any);
-
-  a.emit("message", JSON.stringify({ type: "list-peers" }));
-  const peersMsg = JSON.parse(a.sent.at(-1)!);
-  assert.equal(peersMsg.type, "peers");
-  assert.deepEqual(peersMsg.peers, ["peerB"]);
+  a.sent.length = 0;
+  b.sent.length = 0;
 
   a.emit("message", JSON.stringify({ type: "relay", data: "NM1PAYLOAD" }));
+  assert.equal(b.sent.length, 0, "JSON relay sin `to` no debe transmitirse");
+  assert.equal(JSON.parse(a.sent.at(-1)!).type, "error");
+
+  a.emit("message", JSON.stringify({ type: "relay", to: "peerB", data: "NM2PAYLOAD" }));
   const bRelay = JSON.parse(b.sent.at(-1)!);
   assert.equal(bRelay.type, "relay");
   assert.equal(bRelay.from, "peerA");
-  assert.equal(bRelay.data, "NM1PAYLOAD");
+  assert.equal(bRelay.data, "NM2PAYLOAD");
 });
 
-test("attachSignalingToHttpServer sirve relay DERP sobre /ws en un único puerto", async () => {
+test("attachSignalingToHttpServer sirve relay dirigido sobre /ws en un único puerto", async () => {
   const server = createServer((_req, res) => {
     res.writeHead(200);
     res.end("ok");
@@ -81,11 +77,11 @@ test("attachSignalingToHttpServer sirve relay DERP sobre /ws en un único puerto
   wsB.send(JSON.stringify({ type: "register", from: "nodeB" }));
   await new Promise((r) => setTimeout(r, 80));
 
-  wsA.send(JSON.stringify({ type: "relay", data: Buffer.from("NM1\x0810.0.0.2ENC").toString("base64") }));
+  wsA.send(JSON.stringify({ type: "relay", to: "nodeB", data: Buffer.from("CIPHER").toString("base64") }));
   await new Promise((r) => setTimeout(r, 80));
 
   const relay = receivedB.find((m) => m.type === "relay");
-  assert.ok(relay, "nodeB debe recibir el frame por /ws");
+  assert.ok(relay, "nodeB debe recibir el frame dirigido por /ws");
   assert.equal(relay.from, "nodeA");
 
   wsA.close();

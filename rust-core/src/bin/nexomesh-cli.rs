@@ -79,6 +79,14 @@ fn run_tunnel(args: &[String]) {
             return;
         }
     };
+    let (peer_sign_b64, _) = nexomesh_core::keys::sign_challenge_b64(&peer_key, "");
+    if let Ok(pk_raw) = base64_decode(&peer_sign_b64) {
+        if pk_raw.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&pk_raw);
+            node.set_relay_target_signing_key(arr);
+        }
+    }
 
     if let Some(peer_addr_str) = arg(args, "--peer-addr") {
         match peer_addr_str.parse::<SocketAddr>() {
@@ -99,9 +107,9 @@ fn run_tunnel(args: &[String]) {
     let mut ws: Option<WsClient> = match &relay_url {
         Some(url) => match WsClient::connect(url) {
             Ok(mut client) => {
-                let (sign_pub, _) = nexomesh_core::keys::sign_challenge_b64(&local_key, "");
-                // Esperar brevemente por si el servidor envía `{type:"challenge",nonce}`
-                let mut reg_id = node_id.clone();
+                let (sign_pub, bind_sig) =
+                    nexomesh_core::keys::sign_challenge_b64(&local_key, &format!("bind:{local_key}"));
+                let mut reg_id = sign_pub.clone();
                 let mut sig = String::new();
                 if let Ok(Some(WsFrame::Text(first))) = client.recv_frame() {
                     if extract_json_str(&first, "type").as_deref() == Some("challenge") {
@@ -114,9 +122,13 @@ fn run_tunnel(args: &[String]) {
                     }
                 }
                 let reg = if sig.is_empty() {
-                    format!(r#"{{"type":"register","from":"{reg_id}"}}"#)
+                    format!(
+                        r#"{{"type":"register","from":"{reg_id}","nodeKey":"{local_key}","bindingSignature":"{bind_sig}"}}"#
+                    )
                 } else {
-                    format!(r#"{{"type":"register","from":"{reg_id}","signature":"{sig}"}}"#)
+                    format!(
+                        r#"{{"type":"register","from":"{reg_id}","signature":"{sig}","nodeKey":"{local_key}","bindingSignature":"{bind_sig}"}}"#
+                    )
                 };
                 if let Err(e) = client.send_text(&reg) {
                     eprintln!("[RELAY] error al registrar en {url}: {e}");
@@ -152,6 +164,7 @@ fn run_tunnel(args: &[String]) {
     let mut ping_sent_at: Option<(u16, Instant)> = None;
 
     loop {
+        node.tick();
         if last_hello.elapsed() >= Duration::from_secs(5) {
             let _ = node.send_hello(&node_id);
             last_hello = Instant::now();
@@ -201,6 +214,9 @@ fn run_tunnel(args: &[String]) {
             Ok(Some(NodeEvent::DiscoPong { vip, tx_id, from })) => {
                 println!("[DISCO] Pong #{tx_id} de {vip} en {from} -> enlace directo activo");
             }
+            Ok(Some(NodeEvent::Rekeyed { vip })) => {
+                println!("[PFS] Clave de transporte rotada automáticamente con {vip}");
+            }
             Ok(Some(NodeEvent::Packet { sender_vip, packet })) => {
                 handle_decrypted_packet(&node, &local, &sender_vip, &packet, "DIRECT UDP", &mut ping_sent_at);
             }
@@ -216,15 +232,21 @@ fn run_tunnel(args: &[String]) {
                     if extract_json_str(&txt, "type").as_deref() == Some("relay") {
                         if let Some(b64) = extract_json_str(&txt, "data") {
                             if let Ok(frame) = base64_decode(&b64) {
-                                if let Ok((sender_vip, packet)) = Node::parse_nm1_frame(&frame) {
-                                    handle_decrypted_packet(
-                                        &node,
-                                        &local,
-                                        &sender_vip,
-                                        &packet,
-                                        "RELAY WS",
-                                        &mut ping_sent_at,
-                                    );
+                                match node.feed_relay_event(&frame) {
+                                    Ok(Some(NodeEvent::Packet { sender_vip, packet })) => {
+                                        handle_decrypted_packet(
+                                            &node,
+                                            &local,
+                                            &sender_vip,
+                                            &packet,
+                                            "RELAY WS",
+                                            &mut ping_sent_at,
+                                        );
+                                    }
+                                    Ok(Some(NodeEvent::Rekeyed { vip })) => {
+                                        println!("[PFS] Clave de transporte rotada vía DERP con {vip}");
+                                    }
+                                    _ => {}
                                 }
                             }
                         }

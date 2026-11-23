@@ -196,6 +196,16 @@ pub fn needs_rekey(peer_id: &str) -> bool {
         || st.created_at.elapsed() >= Duration::from_secs(REKEY_AFTER_SECS)
 }
 
+/// Fuerza que `needs_rekey(peer_id)` devuelva `true` en el siguiente ciclo (rotación inmediata).
+pub fn schedule_rekey_now(peer_id: &str) {
+    let mut guard = SESSIONS.lock().unwrap();
+    if let Some(map) = guard.as_mut() {
+        if let Some(st) = map.get_mut(peer_id) {
+            st.tx_counter = REKEY_AFTER_MESSAGES;
+        }
+    }
+}
+
 /// Cifra con contador secuencial de 64 bits: `0x03 | counter(8B LE) | ciphertext(AEAD)`.
 pub fn seal(peer_id: &str, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut guard = SESSIONS.lock().unwrap();

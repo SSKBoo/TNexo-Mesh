@@ -1,12 +1,15 @@
 use nexomesh_core::acl::{AclEngine, AclRule, Action, Proto};
 use nexomesh_core::keys::dual_stack_ips_from_pubkey;
-use nexomesh_core::magic_dns::MagicDns;
+use nexomesh_core::magic_dns::{spawn_split_dns_server, MagicDns};
 use nexomesh_core::nat::{
     bind_birthday_sockets, nat_pmp_udp_map_request, parse_nat_pmp_map_response,
     upnp_ssdp_discover_packet,
 };
 use nexomesh_core::routing::RoutingTable;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[test]
 fn magic_dns_resolves_mesh_names_and_splits_external() {
@@ -101,4 +104,58 @@ fn dual_stack_ipv4_and_ipv6_ula_from_pubkey() {
     assert_eq!(v4.octets()[0..3], [10, 0, 0]);
     assert!(v4.octets()[3] >= 2);
     assert_eq!(&v6.octets()[0..6], &[0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0]);
+}
+
+#[test]
+fn magic_dns_nexomesh_and_split_dns_udp_server() {
+    let mut dns = MagicDns::new();
+    dns.register("nas-casa", Ipv4Addr::new(10, 0, 0, 9), None);
+    assert_eq!(dns.resolve_v4("nas-casa.nexomesh"), Some(Ipv4Addr::new(10, 0, 0, 9)));
+
+    // Upstream falso que responde 1.2.3.4 para cualquier dominio externo
+    let upstream = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let up_addr = upstream.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        if let Ok((n, from)) = upstream.recv_from(&mut buf) {
+            let mut resp = buf[..n].to_vec();
+            resp[2] = 0x81;
+            resp[3] = 0x80;
+            let _ = upstream.send_to(&resp, from);
+        }
+    });
+
+    let (dns_addr, running) =
+        spawn_split_dns_server("127.0.0.1:0", &up_addr.to_string(), Arc::new(Mutex::new(dns)))
+            .unwrap();
+
+    // Consulta Split DNS local para nas-casa.nexomesh
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let mut q_mesh = vec![0xAA, 0xBB, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    q_mesh.push(8);
+    q_mesh.extend_from_slice(b"nas-casa");
+    q_mesh.push(8);
+    q_mesh.extend_from_slice(b"nexomesh");
+    q_mesh.push(0);
+    q_mesh.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+    client.send_to(&q_mesh, dns_addr).unwrap();
+    let mut rbuf = [0u8; 512];
+    let (rn, _) = client.recv_from(&mut rbuf).unwrap();
+    assert_eq!(&rbuf[rn - 4..rn], &[10, 0, 0, 9]);
+
+    // Consulta externa -> reenviada al upstream
+    let mut q_ext = vec![0xCC, 0xDD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    q_ext.push(7);
+    q_ext.extend_from_slice(b"example");
+    q_ext.push(3);
+    q_ext.extend_from_slice(b"com");
+    q_ext.push(0);
+    q_ext.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+    client.send_to(&q_ext, dns_addr).unwrap();
+    let (en, _) = client.recv_from(&mut rbuf).unwrap();
+    assert_eq!(&rbuf[0..2], &[0xCC, 0xDD]);
+    assert!(en >= q_ext.len());
+
+    running.store(false, Ordering::Relaxed);
 }
