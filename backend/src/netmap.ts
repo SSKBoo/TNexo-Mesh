@@ -14,11 +14,38 @@ export interface NetMapNode {
   signingKey: string;
   userId: string;
   virtualIp: string;
+  virtualIpv6: string;
   approved: boolean;
   expiresAt: number;
   homeDerp: number;
   endpoints: string[];
   subnets: string[];
+}
+
+/** Deriva IPv6 ULA `fd7a:115c:a1e0:...` determinista desde la NodeKey (dual-stack estilo Tailscale). */
+export function deriveDualStackIpv6Ula(nodeKey: string): string {
+  const hash = crypto.createHash("sha256").update(nodeKey).digest();
+  const g3 = hash.subarray(0, 2).toString("hex");
+  const g4 = hash.subarray(2, 4).toString("hex");
+  const g5 = hash.subarray(4, 6).toString("hex");
+  const g6 = hash.subarray(6, 8).toString("hex");
+  return `fd7a:115c:a1e0:${g3}:${g4}:${g5}:${g6}::1`.replace(":::", "::");
+}
+
+/** Valida un claim OIDC (JWT payload `sub`/`email` + expiración) asociado al `userId`. */
+export function verifyOidcClaim(oidcToken: string, expectedUserId: string): boolean {
+  const parts = oidcToken.split(".");
+  if (parts.length !== 3) return false;
+  try {
+    const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    const sub = String(claims.email ?? claims.sub ?? "");
+    const exp = Number(claims.exp ?? 0);
+    if (!sub || sub !== expectedUserId) return false;
+    if (exp > 0 && exp * 1000 < Date.now()) return false;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export interface NetMapPayload {
@@ -74,10 +101,11 @@ export class NetMapAuthority {
   }
 
   registerNode(
-    node: Omit<NetMapNode, "approved" | "expiresAt" | "homeDerp"> & {
+    node: Omit<NetMapNode, "approved" | "expiresAt" | "homeDerp" | "virtualIpv6"> & {
       approved?: boolean;
       ttlMs?: number;
       homeDerp?: number;
+      virtualIpv6?: string;
     },
     bindingSignature: string
   ): NetMapNode {
@@ -90,6 +118,7 @@ export class NetMapAuthority {
       signingKey: node.signingKey,
       userId: node.userId,
       virtualIp: node.virtualIp,
+      virtualIpv6: node.virtualIpv6 || deriveDualStackIpv6Ula(node.nodeKey),
       approved: node.approved ?? false,
       expiresAt: Date.now() + ttlMs,
       homeDerp: node.homeDerp ?? 1,
@@ -107,6 +136,17 @@ export class NetMapAuthority {
     const rec = this.nodes.get(signingKey);
     if (!rec) return null;
     rec.approved = approved;
+    this.store?.saveNetMapNode(rec);
+    this.version += 1;
+    return rec;
+  }
+
+  /** Revocación instantánea de dispositivo: invalida aprobación y expiración al instante. */
+  revokeNode(signingKey: string): NetMapNode | null {
+    const rec = this.nodes.get(signingKey);
+    if (!rec) return null;
+    rec.approved = false;
+    rec.expiresAt = 0;
     this.store?.saveNetMapNode(rec);
     this.version += 1;
     return rec;

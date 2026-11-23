@@ -4,7 +4,7 @@ import { attachSignalingToHttpServer, createSignalingServer, DerpMeshRouter, Sig
 import { createTurnRouter } from "./turn.ts";
 import { createPushRouter } from "./push.ts";
 import { createInvitesRouter } from "./invites.ts";
-import { NetMapAuthority } from "./netmap.ts";
+import { NetMapAuthority, verifyOidcClaim } from "./netmap.ts";
 import { getStore } from "./store.ts";
 
 export function parseDerpRegionsEnv(): Array<{ id: number; name: string; host: string; port: number }> {
@@ -59,13 +59,20 @@ export function createApp(
   });
   app.post("/netmap/register", (req, res) => {
     try {
-      const { nodeKey, signingKey, userId, virtualIp, endpoints, subnets, bindingSignature, approved, ttlMs, homeDerp } =
-        req.body ?? {};
+      const {
+        nodeKey, signingKey, userId, virtualIp, endpoints, subnets,
+        bindingSignature, approved, ttlMs, homeDerp, oidcToken,
+      } = req.body ?? {};
+      const resolvedUser = String(userId ?? "user");
+      if (typeof oidcToken === "string" && oidcToken.length > 0 && !verifyOidcClaim(oidcToken, resolvedUser)) {
+        res.status(401).json({ error: "invalid oidcToken for userId" });
+        return;
+      }
       const node = authority.registerNode(
         {
           nodeKey,
           signingKey,
-          userId: userId ?? "user",
+          userId: resolvedUser,
           virtualIp: virtualIp ?? "10.0.0.2",
           endpoints: Array.isArray(endpoints) ? endpoints : [],
           subnets: Array.isArray(subnets) ? subnets : [],
@@ -75,6 +82,7 @@ export function createApp(
         },
         String(bindingSignature ?? "")
       );
+      if (node.approved) hub?.broadcastNetMap();
       res.status(201).json(node);
     } catch (e: any) {
       res.status(400).json({ error: e?.message ?? "registration failed" });
@@ -87,7 +95,28 @@ export function createApp(
       res.status(404).json({ error: "device not found" });
       return;
     }
+    if (approved === false) {
+      hub?.revokePeer(String(signingKey ?? ""));
+    } else {
+      hub?.broadcastNetMap();
+    }
     res.json(updated);
+  });
+  app.post("/netmap/revoke", (req, res) => {
+    const signingKey = String(req.body?.signingKey ?? "");
+    const revoked = authority.revokeNode(signingKey);
+    if (!revoked) {
+      res.status(404).json({ error: "device not found" });
+      return;
+    }
+    hub?.revokePeer(signingKey);
+    res.json({ ok: true, revoked });
+  });
+  app.post("/netmap/acls", (req, res) => {
+    const rules = Array.isArray(req.body?.acls) ? req.body.acls : [];
+    authority.setAcls(rules);
+    hub?.broadcastNetMap();
+    res.json({ ok: true, acls: rules });
   });
   app.get("/netmap", (_req, res) => {
     res.json(authority.issueSignedNetMap());

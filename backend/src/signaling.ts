@@ -128,15 +128,43 @@ export class SignalingHub {
     this.authority = authority;
   }
 
-  register(publicKey: string, socket: SignalingSocket): void {
+  broadcastNetMap(): void {
+    if (!this.authority) return;
+    const payload = JSON.stringify({ type: "netmap", netmap: this.authority.issueSignedNetMap() });
     for (const [pk, rec] of this.peers) {
-      if (pk !== publicKey) {
-        safeSend(rec.socket, JSON.stringify({ type: "peer-joined", payload: { publicKey } }));
+      if (this.authority.isActiveAndApproved(pk)) {
+        safeSend(rec.socket, payload);
+      }
+    }
+  }
+
+  /** Revoca un par al instante: cierra su WebSocket, limpia rutas y difunde nuevo NetMap firmado. */
+  revokePeer(publicKey: string): boolean {
+    const rec = this.peers.get(publicKey);
+    if (rec) {
+      safeSend(rec.socket, JSON.stringify({ type: "error", payload: "device revoked" }));
+      try { rec.socket.close(); } catch {}
+      this.peers.delete(publicKey);
+      this.router?.removeHome(publicKey, this.regionId);
+    }
+    this.broadcastNetMap();
+    return Boolean(rec);
+  }
+
+  register(publicKey: string, socket: SignalingSocket): void {
+    if (!this.authority) {
+      for (const [pk, rec] of this.peers) {
+        if (pk !== publicKey) {
+          safeSend(rec.socket, JSON.stringify({ type: "peer-joined", payload: { publicKey } }));
+        }
       }
     }
     this.peers.set(publicKey, { publicKey, socket, lastHeartbeat: Date.now() });
     this.router?.announceHome(publicKey, this.regionId);
     this.authority?.updateHomeDerp(publicKey, this.regionId);
+    if (this.authority) {
+      this.broadcastNetMap();
+    }
     socket.on("close", () => this.remove(publicKey));
     socket.on("message", (raw: any) => this.handleMessage(publicKey, raw));
   }

@@ -61,6 +61,7 @@ export class Store {
     nodeKey: string;
     userId: string;
     virtualIp: string;
+    virtualIpv6?: string;
     approved: boolean;
     expiresAt: number;
     homeDerp?: number;
@@ -69,13 +70,14 @@ export class Store {
   }): void {
     this.db.prepare(
       `INSERT OR REPLACE INTO netmap_nodes
-       (signing_key, node_key, user_id, virtual_ip, approved, expires_at, home_derp, endpoints, subnets)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (signing_key, node_key, user_id, virtual_ip, virtual_ipv6, approved, expires_at, home_derp, endpoints, subnets)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       node.signingKey,
       node.nodeKey,
       node.userId,
       node.virtualIp,
+      node.virtualIpv6 ?? "",
       node.approved ? 1 : 0,
       node.expiresAt,
       node.homeDerp ?? 1,
@@ -89,6 +91,7 @@ export class Store {
     nodeKey: string;
     userId: string;
     virtualIp: string;
+    virtualIpv6: string;
     approved: boolean;
     expiresAt: number;
     homeDerp: number;
@@ -101,6 +104,7 @@ export class Store {
       nodeKey: r.node_key,
       userId: r.user_id,
       virtualIp: r.virtual_ip,
+      virtualIpv6: String(r.virtual_ipv6 ?? ""),
       approved: Boolean(r.approved),
       expiresAt: Number(r.expires_at),
       homeDerp: Number(r.home_derp ?? 1),

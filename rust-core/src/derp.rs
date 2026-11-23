@@ -177,6 +177,11 @@ impl Node {
         self.peer_addr
     }
 
+    /// Exige que la sesión complete primero el handshake 1-RTT `Noise_IKpsk2` antes de enviar IP cifrado.
+    pub fn require_noise_ik_1rtt(&self) {
+        session::set_strict_noise_required(&self.peer_vip, true);
+    }
+
     /// Configura la clave pública Ed25519 destino (32 bytes) para encapsular el relay en `NM2`.
     pub fn set_relay_target_signing_key(&mut self, pub_raw: [u8; 32]) {
         self.relay_target_key = Some(pub_raw);

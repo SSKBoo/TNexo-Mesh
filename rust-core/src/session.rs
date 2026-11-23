@@ -78,6 +78,7 @@ struct PeerSessionState {
     pending_noise: Option<NoiseInitiator>,
     noise_session: Option<StatelessNoiseSession>,
     noise_handshake_attempted: bool,
+    strict_noise_required: bool,
 }
 
 static SESSIONS: Mutex<Option<HashMap<String, PeerSessionState>>> = Mutex::new(None);
@@ -153,9 +154,20 @@ pub fn ensure_session(peer_id: &str, local_priv_text: &str, peer_pub_text: &str)
             pending_noise: None,
             noise_session: None,
             noise_handshake_attempted: false,
+            strict_noise_required: false,
         },
     );
     Ok(())
+}
+
+/// Exige handshake 1-RTT `Noise_IKpsk2` antes de sellar datos (prohíbe uso de llave estática).
+pub fn set_strict_noise_required(peer_id: &str, required: bool) {
+    let mut guard = SESSIONS.lock().unwrap();
+    if let Some(map) = guard.as_mut() {
+        if let Some(st) = map.get_mut(peer_id) {
+            st.strict_noise_required = required;
+        }
+    }
 }
 
 /// Inicia un handshake completo `Noise_IKpsk2` de 1-RTT con llave efímera aleatoria (`-> e, es, s, ss`).
@@ -251,6 +263,7 @@ pub fn begin_pfs_rekey(peer_id: &str) -> anyhow::Result<[u8; 32]> {
         pending_noise: None,
         noise_session: None,
         noise_handshake_attempted: false,
+        strict_noise_required: false,
     });
     entry.ephemeral_secret = Some(eph);
     Ok(pub_bytes)
@@ -323,6 +336,12 @@ pub fn seal(peer_id: &str, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
         return Ok(out);
     }
 
+    if st.strict_noise_required && st.noise_session.is_none() {
+        return Err(anyhow::anyhow!(
+            "strict 1-RTT Noise_IKpsk2 handshake required before sealing data"
+        ));
+    }
+
     let cipher = ChaCha20Poly1305::new_from_slice(&st.key)?;
     let nonce_bytes = counter_to_nonce(counter);
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -370,6 +389,12 @@ pub fn open(peer_id: &str, frame: &[u8]) -> anyhow::Result<Vec<u8>> {
 
     if frame[0] != FRAME_V3_COUNTER {
         return Err(anyhow::anyhow!("unsupported frame version"));
+    }
+
+    if st.strict_noise_required && st.noise_session.is_none() {
+        return Err(anyhow::anyhow!(
+            "strict 1-RTT Noise_IKpsk2 handshake required before sealing data"
+        ));
     }
 
     let cipher = ChaCha20Poly1305::new_from_slice(&st.key)?;

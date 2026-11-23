@@ -22,6 +22,7 @@ export function openDb(path: string = ":memory:"): Database.Database {
       node_key TEXT NOT NULL,
       user_id TEXT NOT NULL,
       virtual_ip TEXT NOT NULL,
+      virtual_ipv6 TEXT NOT NULL DEFAULT '',
       approved INTEGER NOT NULL,
       expires_at INTEGER NOT NULL,
       home_derp INTEGER NOT NULL DEFAULT 1,
@@ -33,5 +34,10 @@ export function openDb(path: string = ":memory:"): Database.Database {
       rules TEXT NOT NULL
     );
   `);
+  try {
+    db.exec("ALTER TABLE netmap_nodes ADD COLUMN virtual_ipv6 TEXT NOT NULL DEFAULT ''");
+  } catch {
+    // La columna ya existe
+  }
   return db;
 }

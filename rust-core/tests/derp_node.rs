@@ -313,3 +313,30 @@ fn noise_ik_1rtt_initial_handshake_and_netcheck_report() {
     let new_port = node_a.rebind_udp().unwrap();
     assert_ne!(new_port, old_port);
 }
+
+#[test]
+fn strict_noise_ik_rejects_static_until_1rtt_completes() {
+    session::ensure_session("10.0.0.71", "STRICT_A", "STRICT_B").unwrap();
+    session::ensure_session("10.0.0.70", "STRICT_B", "STRICT_A").unwrap();
+
+    let mut node_a = Node::bind("10.0.0.70", "10.0.0.71", 0).unwrap();
+    let mut node_b = Node::bind("10.0.0.71", "10.0.0.70", 0).unwrap();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", node_a.local_port().unwrap()).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", node_b.local_port().unwrap()).parse().unwrap();
+    node_a.set_peer(addr_b);
+    node_b.set_peer(addr_a);
+    node_a.require_noise_ik_1rtt();
+
+    let pkt = build_icmp_echo_request("10.0.0.70", "10.0.0.71", 9).unwrap();
+    assert!(
+        node_a.send_packet(&pkt).is_err(),
+        "no debe sellar paquetes con clave estática antes del handshake Noise IK 1-RTT"
+    );
+
+    node_a.start_noise_ik_handshake().unwrap();
+    assert!(matches!(node_b.poll_udp_once().unwrap(), Some(NodeEvent::Rekeyed { .. })));
+    assert!(matches!(node_a.poll_udp_once().unwrap(), Some(NodeEvent::Rekeyed { .. })));
+
+    assert!(node_a.send_packet(&pkt).is_ok());
+    assert!(matches!(node_b.poll_udp_once().unwrap(), Some(NodeEvent::Packet { .. })));
+}
