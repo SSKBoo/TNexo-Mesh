@@ -21,6 +21,10 @@ export function openDb(path: string = ":memory:"): Database.Database {
       signing_key TEXT PRIMARY KEY,
       node_key TEXT NOT NULL,
       user_id TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'oidc',
+      groups_json TEXT NOT NULL DEFAULT '[]',
+      tags_json TEXT NOT NULL DEFAULT '[]',
+      ssh_enabled INTEGER NOT NULL DEFAULT 1,
       virtual_ip TEXT NOT NULL,
       virtual_ipv6 TEXT NOT NULL DEFAULT '',
       approved INTEGER NOT NULL,
@@ -34,10 +38,18 @@ export function openDb(path: string = ":memory:"): Database.Database {
       rules TEXT NOT NULL
     );
   `);
-  try {
-    db.exec("ALTER TABLE netmap_nodes ADD COLUMN virtual_ipv6 TEXT NOT NULL DEFAULT ''");
-  } catch {
-    // La columna ya existe
+  for (const col of [
+    "ALTER TABLE netmap_nodes ADD COLUMN virtual_ipv6 TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE netmap_nodes ADD COLUMN provider TEXT NOT NULL DEFAULT 'oidc'",
+    "ALTER TABLE netmap_nodes ADD COLUMN groups_json TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE netmap_nodes ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE netmap_nodes ADD COLUMN ssh_enabled INTEGER NOT NULL DEFAULT 1",
+  ]) {
+    try {
+      db.exec(col);
+    } catch {
+      // La columna ya existe
+    }
   }
   return db;
 }

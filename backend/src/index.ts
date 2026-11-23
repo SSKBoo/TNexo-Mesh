@@ -60,11 +60,16 @@ export function createApp(
   app.post("/netmap/register", (req, res) => {
     try {
       const {
-        nodeKey, signingKey, userId, virtualIp, endpoints, subnets,
+        nodeKey, signingKey, userId, provider, groups, tags, sshEnabled, virtualIp, endpoints, subnets,
         bindingSignature, approved, ttlMs, homeDerp, oidcToken,
       } = req.body ?? {};
       const resolvedUser = String(userId ?? "user");
-      if (typeof oidcToken === "string" && oidcToken.length > 0 && !verifyOidcClaim(oidcToken, resolvedUser)) {
+      const resolvedProvider = (provider ?? "oidc") as "google" | "github" | "oidc";
+      if (
+        typeof oidcToken === "string" &&
+        oidcToken.length > 0 &&
+        !verifyOidcClaim(oidcToken, resolvedUser, resolvedProvider)
+      ) {
         res.status(401).json({ error: "invalid oidcToken for userId" });
         return;
       }
@@ -73,7 +78,11 @@ export function createApp(
           nodeKey,
           signingKey,
           userId: resolvedUser,
-          virtualIp: virtualIp ?? "10.0.0.2",
+          provider: resolvedProvider,
+          groups: Array.isArray(groups) ? groups : [],
+          tags: Array.isArray(tags) ? tags : [],
+          sshEnabled: sshEnabled !== false,
+          virtualIp: virtualIp ?? "auto",
           endpoints: Array.isArray(endpoints) ? endpoints : [],
           subnets: Array.isArray(subnets) ? subnets : [],
           approved: Boolean(approved),
@@ -87,6 +96,12 @@ export function createApp(
     } catch (e: any) {
       res.status(400).json({ error: e?.message ?? "registration failed" });
     }
+  });
+  app.post("/netmap/ssh/authorize", (req, res) => {
+    const srcSigningKey = String(req.body?.srcSigningKey ?? "");
+    const dstSigningKey = String(req.body?.dstSigningKey ?? "");
+    const result = authority.authorizeSsh(srcSigningKey, dstSigningKey);
+    res.status(result.allowed ? 200 : 403).json(result);
   });
   app.post("/netmap/approve", (req, res) => {
     const { signingKey, approved } = req.body ?? {};

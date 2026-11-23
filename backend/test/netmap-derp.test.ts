@@ -209,6 +209,80 @@ test("WS register exige firma válida, vínculo X25519<->Ed25519 y aprobación e
   }
 });
 
+test("IPAM 100.64.0.0/10 asigna sin colisiones y SSH sin llaves valida OIDC group:dev -> tag:server", () => {
+  const store = new Store(":memory:");
+  try {
+    const auth = new NetMapAuthority(store);
+    const dev = genEd();
+    const srv = genEd();
+
+    const n1 = auth.registerNode(
+      {
+        nodeKey: "NODE_DEV_1",
+        signingKey: dev.pubB64,
+        userId: "uriel@nexomesh.io",
+        provider: "google",
+        groups: ["group:dev"],
+        tags: [],
+        virtualIp: "auto",
+        approved: true,
+        endpoints: [],
+        subnets: [],
+      },
+      dev.sign("bind:NODE_DEV_1")
+    );
+    const n2 = auth.registerNode(
+      {
+        nodeKey: "NODE_SRV_1",
+        signingKey: srv.pubB64,
+        userId: "infra@nexomesh.io",
+        provider: "github",
+        groups: [],
+        tags: ["tag:server"],
+        virtualIp: "auto",
+        approved: true,
+        endpoints: [],
+        subnets: [],
+      },
+      srv.sign("bind:NODE_SRV_1")
+    );
+
+    assert.ok(n1.virtualIp.startsWith("100.64."));
+    assert.ok(n2.virtualIp.startsWith("100.64."));
+    assert.notEqual(n1.virtualIp, n2.virtualIp);
+
+    // Detección de colisión explícita en IPAM
+    const extra = genEd();
+    assert.throws(
+      () =>
+        auth.registerNode(
+          {
+            nodeKey: "NODE_DUP",
+            signingKey: extra.pubB64,
+            userId: "x@y",
+            virtualIp: n1.virtualIp,
+            approved: true,
+            endpoints: [],
+            subnets: [],
+          },
+          extra.sign("bind:NODE_DUP")
+        ),
+      /collision/
+    );
+
+    // ACL por grupo/tag con SSH sin llaves
+    auth.setAcls([{ src: "group:dev", dst: "tag:server", proto: "tcp", port: 22, ssh: true }]);
+    const okSsh = auth.authorizeSsh(dev.pubB64, srv.pubB64);
+    assert.equal(okSsh.allowed, true);
+    assert.equal(okSsh.sshCert?.dstIp, n2.virtualIp);
+
+    const deniedSsh = auth.authorizeSsh(srv.pubB64, dev.pubB64);
+    assert.equal(deniedSsh.allowed, false);
+  } finally {
+    store.close();
+  }
+});
+
 test("Federación HTTP/WS entre dos servidores DERP independientes (Región NA <-> Región EU)", async () => {
   const routerNa = new DerpMeshRouter();
   const hubNa = new SignalingHub(1, routerNa);

@@ -54,16 +54,18 @@ pub fn sign_challenge_b64(seed_text: &str, nonce: &str) -> (String, String) {
     )
 }
 
-/// Dual-Stack: deriva una IPv4 determinista en `10.0.0.0/24` y una IPv6 ULA
-/// en `fd7a:115c:a1e0::/48` a partir de la clave pública del nodo.
+/// Dual-Stack CGNAT: deriva una IPv4 determinista en `100.64.0.0/10` (4.19M IPs,
+/// sin saturar `/24`) y una IPv6 ULA en `fd7a:115c:a1e0::/48` desde la clave pública.
 pub fn dual_stack_ips_from_pubkey(pubkey: &str) -> (std::net::Ipv4Addr, std::net::Ipv6Addr) {
     use blake2::{Blake2s256, Digest};
     let mut h = Blake2s256::new();
-    h.update(b"nexomesh-dualstack-v1|");
+    h.update(b"nexomesh-dualstack-v2|");
     h.update(pubkey.as_bytes());
     let out = h.finalize();
-    let octet = (out[0] % 250).max(2);
-    let v4 = std::net::Ipv4Addr::new(10, 0, 0, octet);
+    let o2 = 64 + (out[0] & 0x3F); // 100.64.0.0 .. 100.127.255.255 (/10)
+    let o3 = out[1];
+    let o4 = out[2].clamp(1, 254);
+    let v4 = std::net::Ipv4Addr::new(100, o2, o3, o4);
     let mut v6 = [0u8; 16];
     v6[0] = 0xfd;
     v6[1] = 0x7a;
@@ -71,6 +73,6 @@ pub fn dual_stack_ips_from_pubkey(pubkey: &str) -> (std::net::Ipv4Addr, std::net
     v6[3] = 0x5c;
     v6[4] = 0xa1;
     v6[5] = 0xe0;
-    v6[6..16].copy_from_slice(&out[1..11]);
+    v6[6..16].copy_from_slice(&out[3..13]);
     (v4, std::net::Ipv6Addr::from(v6))
 }

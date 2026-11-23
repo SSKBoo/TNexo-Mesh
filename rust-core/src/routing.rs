@@ -39,6 +39,14 @@ pub fn cidr_matches(cidr: &str, ip: Ipv4Addr) -> bool {
     s.starts_with(cidr.trim_end_matches('/'))
 }
 
+/// Comprueba si una IP pertenece al espacio de malla NexoMesh (`100.64.0.0/10` CGNAT o legacy `10.0.0.0/24`).
+pub fn is_mesh_ipv4(ip: &str) -> bool {
+    let Ok(v4) = ip.trim().parse::<Ipv4Addr>() else {
+        return false;
+    };
+    cidr_matches("100.64.0.0/10", v4) || cidr_matches("10.0.0.0/24", v4)
+}
+
 impl RoutingTable {
     pub fn new() -> Self {
         Self { routes: Vec::new() }

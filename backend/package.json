@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit",
-    "test": "node --import tsx --test \"test/*.test.ts\"",
+    "test": "node --import tsx --test --test-isolation=none \"test/*.test.ts\"",
     "start": "tsx src/serve.ts"
   },
   "dependencies": {

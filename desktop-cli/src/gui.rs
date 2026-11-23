@@ -4,6 +4,8 @@ use nexomesh_core::derp::{
 };
 use nexomesh_core::keys::{sign_challenge_b64, signing_public_key_b64};
 use nexomesh_core::magic_dns::{spawn_split_dns_server, MagicDns};
+use nexomesh_core::netcheck::run_full_netcheck;
+use nexomesh_core::routing::is_mesh_ipv4;
 use nexomesh_core::session;
 use nexomesh_core::ws_client::{
     base64_decode, base64_encode, extract_json_str, WsClient, WsFrame,
@@ -281,10 +283,18 @@ fn handle_http(mut stream: TcpStream, state: Arc<Mutex<GuiState>>) {
             write_http(&mut stream, "200 OK", "application/json", json.as_bytes());
         }
         ("GET", "/api/netcheck") => {
+            let full = run_full_netcheck(
+                "stun.l.google.com:19302",
+                Some("stun1.l.google.com:19302"),
+                Some("stun.l.google.com:19302"),
+                Some("http://connectivitycheck.gstatic.com/generate_204"),
+                &mut [],
+            );
             let g = state.lock().unwrap();
             let json = format!(
-                "{{\"stun\":\"{}\",\"split_dns\":[\".nexomesh\",\".mesh\"],\"node\":{}}}",
+                "{{\"stun\":\"{}\",\"split_dns\":[\".nexomesh\",\".mesh\"],\"diagnostics\":{},\"node\":{}}}",
                 escape_json(&g.last_stun),
+                full.to_json(),
                 g.netcheck_json
             );
             write_http(&mut stream, "200 OK", "application/json", json.as_bytes());
@@ -469,14 +479,14 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
     } else {
         peer_key
     };
-    if let Err(e) = session::ensure_session(&peer_vip, &local_key, &effective_peer_key) {
+    if let Err(e) = session::ensure_noise_session(&peer_vip, &local_key, &effective_peer_key) {
         let mut g = state.lock().unwrap();
         g.events.insert(0, format!("❌ Sesión cripto: {e}"));
         g.tunnel_active = false;
         return;
     }
 
-    // Iniciar resolver local Split-DNS (*.nexomesh / *.mesh) y registrarlo en el SO
+    // Iniciar resolver local Split-DNS (*.nexomesh / *.mesh) en 100.100.100.100:53 (o fallback) y registrarlo en el SO
     let mut mdns = MagicDns::new();
     if let Ok(lv4) = local_vip.parse::<Ipv4Addr>() {
         mdns.register("self", lv4, None);
@@ -484,11 +494,13 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
     if let Ok(pv4) = peer_vip.parse::<Ipv4Addr>() {
         mdns.register("peer", pv4, None);
     }
-    let dns_stop_flag = spawn_split_dns_server("10.0.0.53:53", "1.1.1.1:53", Arc::new(Mutex::new(mdns)))
+    let shared_mdns = Arc::new(Mutex::new(mdns));
+    let dns_stop_flag = spawn_split_dns_server("100.100.100.100:53", "1.1.1.1:53", Arc::clone(&shared_mdns))
+        .or_else(|_| spawn_split_dns_server("10.0.0.53:53", "1.1.1.1:53", Arc::clone(&shared_mdns)))
         .ok()
         .map(|(_, flag)| flag);
     #[cfg(target_os = "windows")]
-    win_tun::configure_windows_split_dns("10.0.0.53");
+    win_tun::configure_windows_split_dns("100.100.100.100");
 
     // Intentar levantar adaptador VPN real en Windows (Wintun) si existe wintun.dll y hay permisos Admin
     #[cfg(target_os = "windows")]
@@ -509,7 +521,7 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
                     let bytes = pkt.bytes();
                     if bytes.len() >= 20 && (bytes[0] >> 4) == 4 {
                         let dst = format!("{}.{}.{}.{}", bytes[16], bytes[17], bytes[18], bytes[19]);
-                        if dst.starts_with("10.0.0.") && dst != tun_local_vip {
+                        if is_mesh_ipv4(&dst) && dst != tun_local_vip {
                             st_tun.lock().unwrap().outbound_packets.push(bytes.to_vec());
                         }
                     }
@@ -527,7 +539,7 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let _unix_tun_guard = match unix_tun::UnixTun::open(&local_vip) {
         Ok(tun) => {
-            unix_tun::configure_unix_split_dns(&tun.name, "10.0.0.53");
+            unix_tun::configure_unix_split_dns(&tun.name, "100.100.100.100");
             let tun_arc = Arc::new(tun);
             let iface_name = tun_arc.name.clone();
             {
@@ -545,7 +557,7 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
                     if let Some(bytes) = tun_rx.read_packet(&mut buf) {
                         if bytes.len() >= 20 && (bytes[0] >> 4) == 4 {
                             let dst = format!("{}.{}.{}.{}", bytes[16], bytes[17], bytes[18], bytes[19]);
-                            if dst.starts_with("10.0.0.") && dst != tun_local_vip {
+                            if is_mesh_ipv4(&dst) && dst != tun_local_vip {
                                 st_tun.lock().unwrap().outbound_packets.push(bytes);
                             }
                         }

@@ -170,6 +170,17 @@ pub fn set_strict_noise_required(peer_id: &str, required: bool) {
     }
 }
 
+/// Registra sesión en modo estricto 1-RTT Noise_IKpsk2 desde el paquete 1 (PFS desde el byte 0).
+pub fn ensure_noise_session(
+    peer_id: &str,
+    local_priv_text: &str,
+    peer_pub_text: &str,
+) -> anyhow::Result<()> {
+    ensure_session(peer_id, local_priv_text, peer_pub_text)?;
+    set_strict_noise_required(peer_id, true);
+    Ok(())
+}
+
 /// Inicia un handshake completo `Noise_IKpsk2` de 1-RTT con llave efímera aleatoria (`-> e, es, s, ss`).
 pub fn begin_noise_ik_handshake(peer_id: &str) -> anyhow::Result<Vec<u8>> {
     let mut guard = SESSIONS.lock().unwrap();

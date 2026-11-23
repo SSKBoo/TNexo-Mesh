@@ -1,6 +1,7 @@
 //! Relay tipo DERP (NM2 dirigido) + máquina de estados Magicsock/Disco y rekeying PFS automático.
 
 use crate::nat;
+use crate::routing::is_mesh_ipv4;
 use crate::session;
 use crate::ws_client::{base64_decode, base64_encode};
 use anyhow::{anyhow, Result};
@@ -484,7 +485,7 @@ impl Node {
             let _ = parts.next();
             let vip = parts.next().unwrap_or("").trim().to_string();
             let name = parts.next().unwrap_or("peer").trim().to_string();
-            if vip.starts_with("10.0.0.") && vip != self.local_vip {
+            if is_mesh_ipv4(&vip) && vip != self.local_vip {
                 if let Some(addr) = from {
                     self.peer_addr = Some(addr);
                     self.add_candidate(addr, RouteKind::StunPublic);
@@ -502,7 +503,7 @@ impl Node {
             let mut parts = text.split('|');
             let _ = parts.next();
             let vip = parts.next().unwrap_or("").trim().to_string();
-            if vip.starts_with("10.0.0.") && vip != self.local_vip {
+            if is_mesh_ipv4(&vip) && vip != self.local_vip {
                 if let Some(addr) = from {
                     self.peer_addr = Some(addr);
                     self.add_candidate(addr, RouteKind::StunPublic);
@@ -519,7 +520,7 @@ impl Node {
             let _ = parts.next();
             let tx_id = parts.next().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
             let vip = parts.next().unwrap_or("").trim().to_string();
-            if vip.starts_with("10.0.0.") && vip != self.local_vip {
+            if is_mesh_ipv4(&vip) && vip != self.local_vip {
                 if let Some(addr) = from {
                     if self.peer_addr.is_none() {
                         self.peer_addr = Some(addr);
@@ -540,7 +541,7 @@ impl Node {
             let _ = parts.next();
             let tx_id = parts.next().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
             let vip = parts.next().unwrap_or("").trim().to_string();
-            if vip.starts_with("10.0.0.") && vip != self.local_vip {
+            if is_mesh_ipv4(&vip) && vip != self.local_vip {
                 if let Some(addr) = from {
                     *self.direct_ok.lock().unwrap() = true;
                     *self.last_direct_rx.lock().unwrap() = Some(Instant::now());

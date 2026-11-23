@@ -216,17 +216,19 @@ pub fn configure_unix_tun_routes(iface: &str, local_vip: &str) -> Result<(), Str
             return Err("ip addr replace falló (requiere sudo/CAP_NET_ADMIN)".to_string());
         }
         let _ = Command::new("ip").args(["link", "set", "dev", iface, "mtu", "1280", "up"]).status();
+        let _ = Command::new("ip").args(["route", "replace", "100.64.0.0/10", "dev", iface]).status();
         let _ = Command::new("ip").args(["route", "replace", "10.0.0.0/24", "dev", iface]).status();
     }
     #[cfg(target_os = "macos")]
     {
         let st = Command::new("ifconfig")
-            .args([iface, "inet", local_vip, local_vip, "netmask", "255.255.255.0", "mtu", "1280", "up"])
+            .args([iface, "inet", local_vip, local_vip, "netmask", "255.192.0.0", "mtu", "1280", "up"])
             .status()
             .map_err(|e| format!("ifconfig error: {e}"))?;
         if !st.success() {
             return Err("ifconfig falló (requiere sudo)".to_string());
         }
+        let _ = Command::new("route").args(["-n", "add", "-net", "100.64.0.0/10", "-interface", iface]).status();
         let _ = Command::new("route").args(["-n", "add", "-net", "10.0.0.0/24", "-interface", iface]).status();
     }
     Ok(())

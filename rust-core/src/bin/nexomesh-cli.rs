@@ -1,7 +1,7 @@
 use nexomesh_core::derp::{
-    build_icmp_echo_request, probe_derp_regions, try_build_icmp_echo_reply, DerpRegion, Node,
-    NodeEvent,
+    build_icmp_echo_request, try_build_icmp_echo_reply, DerpRegion, Node, NodeEvent,
 };
+use nexomesh_core::netcheck::run_full_netcheck;
 use nexomesh_core::session;
 use nexomesh_core::ws_client::{base64_decode, extract_json_str, WsClient, WsFrame};
 use std::env;
@@ -35,22 +35,29 @@ fn print_usage() {
 
 fn run_netcheck(args: &[String]) {
     let stun = arg(args, "--stun").unwrap_or_else(|| "stun.l.google.com:19302".to_string());
+    let stun2 = arg(args, "--stun2");
+    let stun6 = arg(args, "--stun6");
+    let captive = arg(args, "--captive").unwrap_or_else(|| "http://connectivitycheck.gstatic.com/generate_204".to_string());
     let derp_ep = arg(args, "--derp").unwrap_or_else(|| "ws://127.0.0.1:8080/ws".to_string());
-    let stun_res = nexomesh_core::stun::probe_stun_endpoint(&stun)
-        .unwrap_or_else(|e| format!("error:{e}"));
     let mut regions = vec![DerpRegion {
         id: 1,
         name: "configured".to_string(),
         endpoint: derp_ep,
         rtt_ms: u32::MAX,
     }];
-    probe_derp_regions(&mut regions);
-    let node = Node::bind("10.0.0.2", "10.0.0.1", 0).ok();
-    let report = node
+    let full = run_full_netcheck(
+        &stun,
+        stun2.as_deref(),
+        stun6.as_deref(),
+        Some(&captive),
+        &mut regions,
+    );
+    let node = Node::bind("100.64.0.2", "100.64.0.1", 0).ok();
+    let node_json = node
         .as_ref()
         .map(|n| n.netcheck_json(&regions))
         .unwrap_or_else(|| "{}".to_string());
-    println!("{{\"stun\":\"{stun_res}\",\"netcheck\":{report}}}");
+    println!("{{\"netcheck\":{},\"node\":{}}}", full.to_json(), node_json);
 }
 
 fn arg(args: &[String], key: &str) -> Option<String> {

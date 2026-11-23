@@ -15,9 +15,9 @@ function genEd() {
   };
 }
 
-function makeFakeJwt(sub: string, expSec: number): string {
+function makeFakeJwt(sub: string, expSec: number, iss: string = "https://accounts.google.com"): string {
   const h = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
-  const p = Buffer.from(JSON.stringify({ sub, exp: expSec })).toString("base64url");
+  const p = Buffer.from(JSON.stringify({ sub, exp: expSec, iss })).toString("base64url");
   return `${h}.${p}.sig`;
 }
 
@@ -58,14 +58,17 @@ test("E2E Pairing: invitación, OIDC->NodeKey->IPv6, NetMap firmado en Chromium 
         nodeKey: "X25519_NODE_PAIRING",
         signingKey: dev.pubB64,
         userId: "uriel@nexomesh.io",
+        provider: "google",
+        groups: ["group:dev"],
         oidcToken: oidcJwt,
-        virtualIp: "10.0.0.10",
+        virtualIp: "auto",
         bindingSignature: dev.sign("bind:X25519_NODE_PAIRING"),
         approved: false,
       },
     });
     expect(regRes.status()).toBe(201);
     const regNode = await regRes.json();
+    expect(regNode.virtualIp).toMatch(/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./);
     expect(regNode.virtualIpv6).toMatch(/^fd7a:115c:a1e0:/);
 
     // Aprobar dispositivo

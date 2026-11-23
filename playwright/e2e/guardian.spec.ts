@@ -47,30 +47,51 @@ test("E2E Guardian y ACLs: renderiza PWA real, aplica ACLs en NetMap firmado y b
     await expect(page.getByRole("heading", { name: "NexoMesh" })).toBeVisible();
     await expect(page.getByText("Panel de control")).toBeVisible();
 
-    // 2. Registrar dispositivo aprobado y actualizar ACLs en caliente vía /netmap/acls
+    // 2. Registrar dispositivo dev (group:dev) + servidor (tag:server) con ACL SSH sin llaves
     const dev = genEd();
+    const srv = genEd();
     await page.request.post(`http://127.0.0.1:${backendPort}/netmap/register`, {
       data: {
         nodeKey: "X25519_GUARDIAN",
         signingKey: dev.pubB64,
         userId: "sec@nexomesh.io",
-        virtualIp: "10.0.0.20",
+        provider: "google",
+        groups: ["group:dev"],
+        virtualIp: "auto",
         bindingSignature: dev.sign("bind:X25519_GUARDIAN"),
+        approved: true,
+      },
+    });
+    await page.request.post(`http://127.0.0.1:${backendPort}/netmap/register`, {
+      data: {
+        nodeKey: "X25519_SERVER",
+        signingKey: srv.pubB64,
+        userId: "infra@nexomesh.io",
+        provider: "github",
+        tags: ["tag:server"],
+        virtualIp: "auto",
+        bindingSignature: srv.sign("bind:X25519_SERVER"),
         approved: true,
       },
     });
     const aclRes = await page.request.post(`http://127.0.0.1:${backendPort}/netmap/acls`, {
       data: {
-        acls: [{ src: "10.0.0.0/24", dst: "10.0.0.1/32", proto: "udp", port: 19132 }],
+        acls: [{ src: "group:dev", dst: "tag:server", proto: "tcp", port: 22, ssh: true }],
       },
     });
     expect(aclRes.status()).toBe(200);
+
+    const sshOk = await page.request.post(`http://127.0.0.1:${backendPort}/netmap/ssh/authorize`, {
+      data: { srcSigningKey: dev.pubB64, dstSigningKey: srv.pubB64 },
+    });
+    expect(sshOk.status()).toBe(200);
+    expect((await sshOk.json()).allowed).toBe(true);
 
     const nmRes = await page.request.get(`http://127.0.0.1:${backendPort}/netmap`);
     const netmap = await nmRes.json();
     expect(verifySignedNetMap(netmap)).toBe(true);
     expect(netmap.payload.acls.length).toBe(1);
-    expect(netmap.payload.acls[0].port).toBe(19132);
+    expect(netmap.payload.acls[0].port).toBe(22);
 
     // 3. Probar que el WS en Chromium rechaza fallback NM1 y relay JSON sin destinatario `to`
     const nonce = await page.evaluate(async (wsUrl) => {

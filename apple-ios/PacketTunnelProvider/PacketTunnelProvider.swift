@@ -8,8 +8,8 @@ import NexoMeshCore   // XCFramework generado por scripts/build-ios.sh
 /// - Ejecuta Socket Rebinding automático vía `NWPathMonitor` al cambiar Wi-Fi <-> 4G/5G.
 class PacketTunnelProvider: NEPacketTunnelProvider {
 
-    private var localIp: String = "10.0.0.2"
-    private var peerIp: String = "10.0.0.1"
+    private var localIp: String = "100.64.0.2"
+    private var peerIp: String = "100.64.0.1"
     private var mtu: NSNumber = 1280
     private var running = false
     private var pathMonitor: NWPathMonitor?
@@ -36,15 +36,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
-        // 2. Configurar interfaz TUN (10.0.0.0/24) + Split DNS nativo (*.nexomesh / *.mesh)
+        // 2. Configurar interfaz TUN CGNAT (100.64.0.0/10) + Split DNS nativo (*.mesh / *.nexomesh)
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: peerIp)
         settings.mtu = mtu
-        let ipv4 = NEIPv4Settings(addresses: [localIp], subnetMasks: ["255.255.255.0"])
-        ipv4.includedRoutes = [NEIPv4Route(destinationAddress: "10.0.0.0", subnetMask: "255.255.255.0")]
+        let ipv4 = NEIPv4Settings(addresses: [localIp], subnetMasks: ["255.192.0.0"])
+        ipv4.includedRoutes = [
+            NEIPv4Route(destinationAddress: "100.64.0.0", subnetMask: "255.192.0.0"),
+            NEIPv4Route(destinationAddress: "10.0.0.0", subnetMask: "255.255.255.0")
+        ]
         settings.ipv4Settings = ipv4
 
-        let dns = NEDNSSettings(servers: ["10.0.0.53"])
-        dns.matchDomains = ["nexomesh", "mesh"]
+        let dns = NEDNSSettings(servers: ["100.100.100.100"])
+        dns.matchDomains = ["mesh", "nexomesh"]
         settings.dnsSettings = dns
 
         setTunnelNetworkSettings(settings) { [weak self] error in

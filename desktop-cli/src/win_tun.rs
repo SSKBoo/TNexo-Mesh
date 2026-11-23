@@ -35,7 +35,8 @@ pub fn try_start_wintun(local_vip: &str) -> Result<WinTunHandle, String> {
         .or_else(|_| Adapter::create(&wintun, "NexoMesh", "NexoMesh", None))
         .map_err(|e| format!("No se pudo abrir/crear adaptador NexoMesh (¿ejecutar como Administrador?): {e}"))?;
 
-    // Asignar IP virtual en la subred 10.0.0.0/24
+    // Asignar IP virtual (soporta CGNAT 100.64.0.0/10 y subred legacy 10.0.0.0/24)
+    let mask = if local_vip.starts_with("100.") { "255.192.0.0" } else { "255.255.255.0" };
     let status = Command::new("netsh")
         .args([
             "interface",
@@ -45,7 +46,7 @@ pub fn try_start_wintun(local_vip: &str) -> Result<WinTunHandle, String> {
             "name=NexoMesh",
             "static",
             local_vip,
-            "255.255.255.0",
+            mask,
         ])
         .status()
         .map_err(|e| format!("Error ejecutando netsh: {e}"))?;
@@ -53,6 +54,13 @@ pub fn try_start_wintun(local_vip: &str) -> Result<WinTunHandle, String> {
     if !status.success() {
         return Err("netsh falló al asignar IP (ejecuta como Administrador)".to_string());
     }
+
+    let _ = Command::new("netsh")
+        .args(["interface", "ipv4", "add", "route", "100.64.0.0/10", "NexoMesh"])
+        .status();
+    let _ = Command::new("netsh")
+        .args(["interface", "ipv4", "add", "route", "10.0.0.0/24", "NexoMesh"])
+        .status();
 
     let _ = Command::new("netsh")
         .args(["interface", "ipv4", "set", "subinterface", "NexoMesh", "mtu=1380", "store=active"])

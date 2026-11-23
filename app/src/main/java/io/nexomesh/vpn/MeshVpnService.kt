@@ -134,8 +134,8 @@ class MeshVpnService : VpnService() {
                 peerRoutes[item.virtualIp] = item
                 // Inicializar sesión cifrada con este par (X25519 + ChaCha20-Poly1305)
                 if (RustCoreBridge.isNativeReady() && localPublicKey.isNotBlank() && item.peerPublicKey.isNotBlank()) {
-                    val ok = RustCoreBridge.initSession(item.virtualIp, localPublicKey, item.peerPublicKey)
-                    android.util.Log.i("NexoMeshRelay", "initSession(${item.virtualIp})=$ok")
+                    val ok = RustCoreBridge.initStrictNoiseSession(item.virtualIp, localPublicKey, item.peerPublicKey)
+                    android.util.Log.i("NexoMeshRelay", "initStrictNoiseSession(${item.virtualIp})=$ok")
                 }
             }
         }
@@ -155,13 +155,22 @@ class MeshVpnService : VpnService() {
             }
         }
 
+        fun isMeshVip(ip: String): Boolean {
+            if (ip.startsWith("10.0.0.")) return true
+            val parts = ip.split(".")
+            if (parts.size != 4) return false
+            val o1 = parts[0].toIntOrNull() ?: return false
+            val o2 = parts[1].toIntOrNull() ?: return false
+            return o1 == 100 && o2 in 64..127
+        }
+
         fun parseHostPort(raw: String?, defaultPort: Int): Pair<String, Int>? {
             if (raw.isNullOrBlank()) return null
             val clean = raw.trim()
             if (clean.contains(" ") || clean.equals("STUN directo", ignoreCase = true)) return null
             val parts = clean.split(":")
             val host = parts[0].trim()
-            if (host.isEmpty() || host == "0.0.0.0" || host.startsWith("10.0.0.")) return null
+            if (host.isEmpty() || host == "0.0.0.0" || isMeshVip(host)) return null
             val port = parts.getOrNull(1)?.toIntOrNull() ?: defaultPort
             return host to port
         }
@@ -226,8 +235,8 @@ class MeshVpnService : VpnService() {
             for (item in peerRoutes.values) {
                 val pk = item.peerPublicKey.ifBlank { prefs.getString("peer_pk_${item.virtualIp}", "") ?: "" }
                 if (pk.isNotBlank()) {
-                    val ok = RustCoreBridge.initSession(item.virtualIp, localPublicKey, pk)
-                    android.util.Log.i("NexoMeshRelay", "onStart initSession(${item.virtualIp})=$ok")
+                    val ok = RustCoreBridge.initStrictNoiseSession(item.virtualIp, localPublicKey, pk)
+                    android.util.Log.i("NexoMeshRelay", "onStart initStrictNoiseSession(${item.virtualIp})=$ok")
                 }
             }
         }
@@ -249,16 +258,19 @@ class MeshVpnService : VpnService() {
         ensureNotification(localIp)
         acquireWakeLock()
 
-        // Split-tunnel + MagicDNS (10.0.0.53) + Subnet Routers / Exit Node + exclusión por app
+        // Split-tunnel CGNAT 100.64.0.0/10 + legacy 10.0.0.0/24 + MagicDNS 100.100.100.100
+        val prefixLen = if (localIp.startsWith("100.")) 10 else 24
         val builder = Builder()
             .setSession("NexoMesh P2P")
-            .addAddress(localIp, 24)
+            .addAddress(localIp, prefixLen)
+            .addRoute("100.64.0.0", 10)
             .addRoute("10.0.0.0", 24)
             .setMtu(mtu)
             .setBlocking(true)
 
         if (prefs.getBoolean("magic_dns_enabled", true)) {
-            builder.addDnsServer("10.0.0.53")
+            builder.addDnsServer("100.100.100.100")
+            builder.addRoute("100.100.100.100", 32)
             builder.addSearchDomain("nexomesh")
         }
         val subnetRoutes = (intent?.getStringExtra("SUBNET_ROUTES")
@@ -429,8 +441,8 @@ class MeshVpnService : VpnService() {
                         ((buf[ihl + 2].toInt() and 0xFF) shl 8) or (buf[ihl + 3].toInt() and 0xFF)
                     } else 51820
 
-                    // MagicDNS embebido (.mesh) + Split-DNS transparente hacia upstream físico
-                    if (proto == 17 && dstIp == "10.0.0.53" && dstPort == 53 && len > ihl + 8) {
+                    // MagicDNS embebido (.mesh / .nexomesh) en 100.100.100.100 o 10.0.0.53 + Split-DNS upstream
+                    if (proto == 17 && (dstIp == "100.100.100.100" || dstIp == "10.0.0.53") && dstPort == 53 && len > ihl + 8) {
                         val dnsReq = buf.copyOfRange(ihl + 8, len)
                         val reqCopy = buf.copyOfRange(0, len)
                         val localResp = if (RustCoreBridge.isNativeReady()) {
@@ -446,7 +458,7 @@ class MeshVpnService : VpnService() {
                         continue
                     }
 
-                    val targetVip = if (dstIp.startsWith("10.0.0.")) dstIp
+                    val targetVip = if (isMeshVip(dstIp)) dstIp
                     else if (hasExtraRoutes) peerRoutes.keys.firstOrNull { it != localIp } ?: ""
                     else ""
                     if (targetVip.isEmpty() || dstIp == localIp) continue
@@ -554,7 +566,7 @@ class MeshVpnService : VpnService() {
                             val parts = msg.split("|")
                             val peerVip = parts.getOrNull(1)?.trim() ?: ""
                             val b64 = parts.getOrNull(2)?.trim() ?: ""
-                            if (peerVip.startsWith("10.0.0.") && peerVip != localIp && RustCoreBridge.isNativeReady()) {
+                            if (isMeshVip(peerVip) && peerVip != localIp && RustCoreBridge.isNativeReady()) {
                                 try {
                                     val payload = java.util.Base64.getDecoder().decode(b64)
                                     if (msg.startsWith("NM_NOISE_1|")) {
@@ -573,7 +585,7 @@ class MeshVpnService : VpnService() {
                             val parts = msg.split("|")
                             val peerVip = parts.getOrNull(1)?.trim() ?: ""
                             val b64 = parts.getOrNull(2)?.trim() ?: ""
-                            if (peerVip.startsWith("10.0.0.") && peerVip != localIp && RustCoreBridge.isNativeReady()) {
+                            if (isMeshVip(peerVip) && peerVip != localIp && RustCoreBridge.isNativeReady()) {
                                 try {
                                     val peerEph = java.util.Base64.getDecoder().decode(b64)
                                     if (peerEph.size == 32) {
@@ -595,7 +607,7 @@ class MeshVpnService : VpnService() {
                             val parts = msg.split("|")
                             val txId = parts.getOrNull(1)?.trim() ?: "0"
                             val peerVip = parts.getOrNull(2)?.trim() ?: ""
-                            if (peerVip.startsWith("10.0.0.") && peerVip != localIp && pkt.address != null) {
+                            if (isMeshVip(peerVip) && peerVip != localIp && pkt.address != null) {
                                 learnedSocketAddrs[peerVip] = InetSocketAddress(pkt.address, pkt.port)
                                 lastDirectRxMs[peerVip] = System.currentTimeMillis()
                                 if (msg.startsWith("NM_DISCO_PING|")) {
@@ -611,7 +623,7 @@ class MeshVpnService : VpnService() {
                             val peerName = parts.getOrNull(2)?.trim() ?: "Par P2P"
                             val peerPk = parts.getOrNull(4)?.trim() ?: ""
                             val senderIp = pkt.address?.hostAddress ?: ""
-                            if (peerVip.startsWith("10.0.0.") && peerVip != localIp && senderIp.isNotEmpty()) {
+                            if (isMeshVip(peerVip) && peerVip != localIp && senderIp.isNotEmpty()) {
                                 val remote = InetSocketAddress(pkt.address, pkt.port)
                                 learnedSocketAddrs[peerVip] = remote
                                 lastDirectRxMs[peerVip] = System.currentTimeMillis()
@@ -631,7 +643,14 @@ class MeshVpnService : VpnService() {
                                         peerPublicKey = peerPk
                                     )
                                     if (RustCoreBridge.isNativeReady() && localPublicKey.isNotBlank()) {
-                                        RustCoreBridge.initSession(peerVip, localPublicKey, peerPk)
+                                        RustCoreBridge.initStrictNoiseSession(peerVip, localPublicKey, peerPk)
+                                        if (!RustCoreBridge.isNoiseIkEstablished(peerVip)) {
+                                            val msg1 = RustCoreBridge.beginNoiseIkHandshake(peerVip)
+                                            if (msg1.isNotEmpty()) {
+                                                val wire = "NM_NOISE_1|$localIp|${java.util.Base64.getEncoder().encodeToString(msg1)}".toByteArray(Charsets.UTF_8)
+                                                try { sock.send(DatagramPacket(wire, wire.size, pkt.address, pkt.port)) } catch (_: Exception) {}
+                                            }
+                                        }
                                     }
                                 }
                                 peerDiscoveredListener?.invoke(peerVip, peerName, "$senderIp:${pkt.port}")
@@ -655,7 +674,7 @@ class MeshVpnService : VpnService() {
                             if (((rxBuf[4].toInt() ushr 4) and 0x0F) != 4) continue
                             val srcIp = "${rxBuf[16].toInt() and 0xFF}.${rxBuf[17].toInt() and 0xFF}.${rxBuf[18].toInt() and 0xFF}.${rxBuf[19].toInt() and 0xFF}"
                             if (quarantinedIps.contains(srcIp)) { blockedPacketsCount += 1L; continue }
-                            if (srcIp.startsWith("10.0.0.") && srcIp != localIp && pkt.address != null) {
+                            if (isMeshVip(srcIp) && srcIp != localIp && pkt.address != null) {
                                 learnedSocketAddrs[srcIp] = InetSocketAddress(pkt.address, pkt.port)
                             }
                             synchronized(lockWrite) { tunOut.write(rxBuf, 4, ipLen) }
@@ -682,7 +701,7 @@ class MeshVpnService : VpnService() {
                             if (packet.isEmpty() || ((packet[0].toInt() ushr 4) and 0x0F) != 4) continue
                             val srcIp = "${packet[12].toInt() and 0xFF}.${packet[13].toInt() and 0xFF}.${packet[14].toInt() and 0xFF}.${packet[15].toInt() and 0xFF}"
                             if (quarantinedIps.contains(srcIp)) { blockedPacketsCount += 1L; continue }
-                            if (senderVip.startsWith("10.0.0.") && senderVip != localIp && pkt.address != null) {
+                            if (isMeshVip(senderVip) && senderVip != localIp && pkt.address != null) {
                                 learnedSocketAddrs[senderVip] = InetSocketAddress(pkt.address, pkt.port)
                                 lastDirectRxMs[senderVip] = System.currentTimeMillis()
                             }

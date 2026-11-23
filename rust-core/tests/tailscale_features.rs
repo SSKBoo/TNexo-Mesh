@@ -1,12 +1,16 @@
-use nexomesh_core::acl::{AclEngine, AclRule, Action, Proto};
+use nexomesh_core::acl::{AclEngine, AclRule, Action, IdentityAclEngine, IdentityAclRule, NodeIdentity, Proto};
+use nexomesh_core::derp::DerpRegion;
 use nexomesh_core::keys::dual_stack_ips_from_pubkey;
 use nexomesh_core::magic_dns::{spawn_split_dns_server, MagicDns};
 use nexomesh_core::nat::{
     bind_birthday_sockets, nat_pmp_udp_map_request, parse_nat_pmp_map_response,
     upnp_ssdp_discover_packet,
 };
+use nexomesh_core::netcheck::run_full_netcheck;
 use nexomesh_core::routing::RoutingTable;
-use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
+use nexomesh_core::ssh::{issue_mesh_ssh_ticket, verify_mesh_ssh_ticket};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -101,9 +105,128 @@ fn nat_birthday_sockets_and_pmp_upnp_packets() {
 #[test]
 fn dual_stack_ipv4_and_ipv6_ula_from_pubkey() {
     let (v4, v6) = dual_stack_ips_from_pubkey("XkKcWKIU2YEziA4EO7T178Btu5RDt6qiN8KH7VpChfU=");
-    assert_eq!(v4.octets()[0..3], [10, 0, 0]);
-    assert!(v4.octets()[3] >= 2);
+    assert_eq!(v4.octets()[0], 100);
+    assert!((64..=127).contains(&v4.octets()[1]));
+    assert!((1..=254).contains(&v4.octets()[3]));
     assert_eq!(&v6.octets()[0..6], &[0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0]);
+}
+
+#[test]
+fn netcheck_detects_captive_portal_mapping_variability_and_hairpinning() {
+    // 1. Mock portal cautivo HTTP 302
+    let captive_srv = TcpListener::bind("127.0.0.1:0").unwrap();
+    let captive_port = captive_srv.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        if let Ok((mut s, _)) = captive_srv.accept() {
+            let mut req = [0u8; 256];
+            let _ = s.read(&mut req);
+            let _ = s.write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: http://hotel.wifi/login\r\nContent-Length: 0\r\n\r\n",
+            );
+        }
+    });
+
+    // 2. Dos servidores STUN falsos devolviendo distintos puertos mapeados (simula Symmetric NAT)
+    let spawn_stun = |mapped_port: u16| -> String {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 128];
+            if let Ok((n, from)) = sock.recv_from(&mut buf) {
+                if n >= 20 {
+                    let mut resp = [0u8; 32];
+                    resp[0] = 0x01;
+                    resp[1] = 0x01;
+                    resp[2..4].copy_from_slice(&12u16.to_be_bytes());
+                    resp[4..20].copy_from_slice(&buf[4..20]);
+                    resp[20..24].copy_from_slice(&[0x00, 0x20, 0x00, 0x08]);
+                    resp[24] = 0x00;
+                    resp[25] = 0x01;
+                    let xp = mapped_port ^ 0x2112;
+                    resp[26..28].copy_from_slice(&xp.to_be_bytes());
+                    resp[28] = 127 ^ 0x21;
+                    resp[29] = 0 ^ 0x12;
+                    resp[30] = 0 ^ 0xA4;
+                    resp[31] = 1 ^ 0x42;
+                    let _ = sock.send_to(&resp, from);
+                }
+            }
+        });
+        addr.to_string()
+    };
+
+    let stun1 = spawn_stun(40001);
+    let stun2 = spawn_stun(40002);
+    let derp_tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let derp_port = derp_tcp.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let _ = derp_tcp.accept();
+    });
+
+    let mut regions = vec![DerpRegion {
+        id: 7,
+        name: "mx-central".into(),
+        endpoint: format!("ws://127.0.0.1:{derp_port}/ws"),
+        rtt_ms: u32::MAX,
+    }];
+
+    let report = run_full_netcheck(
+        &stun1,
+        Some(&stun2),
+        None,
+        Some(&format!("http://127.0.0.1:{captive_port}/generate_204")),
+        &mut regions,
+    );
+    assert!(report.udp_v4);
+    assert_eq!(report.mapping_varies_by_dest_ip, Some(true));
+    assert_eq!(report.captive_portal.checked, true);
+    assert_eq!(report.captive_portal.detected, true);
+    assert_eq!(report.preferred_derp, Some(7));
+    let json = report.to_json();
+    assert!(json.contains("hotel.wifi/login"));
+}
+
+#[test]
+fn identity_acl_groups_tags_and_keyless_mesh_ssh_ticket() {
+    let mut engine = IdentityAclEngine::new(Action::Deny);
+    engine.add_rule(IdentityAclRule {
+        action: Action::Allow,
+        src_selector: "group:dev".into(),
+        dst_selector: "tag:server".into(),
+        proto: Proto::Tcp,
+        dst_port: Some(22),
+        allow_ssh: true,
+    });
+
+    let dev = NodeIdentity {
+        ip: Ipv4Addr::new(100, 64, 0, 2),
+        user_id: "uriel@nexomesh.io".into(),
+        groups: vec!["group:dev".into()],
+        tags: vec![],
+    };
+    let guest = NodeIdentity {
+        ip: Ipv4Addr::new(100, 64, 0, 9),
+        user_id: "guest@ext.io".into(),
+        groups: vec!["group:guest".into()],
+        tags: vec![],
+    };
+    let prod_srv = NodeIdentity {
+        ip: Ipv4Addr::new(100, 64, 1, 10),
+        user_id: "infra@nexomesh.io".into(),
+        groups: vec![],
+        tags: vec!["tag:server".into()],
+    };
+
+    assert_eq!(engine.evaluate_flow(&dev, &prod_srv, 6, 22), Action::Allow);
+    assert_eq!(engine.evaluate_flow(&guest, &prod_srv, 6, 22), Action::Deny);
+
+    let ticket = issue_mesh_ssh_ticket("control-ssh-seed", &engine, &dev, &prod_srv, 300)
+        .expect("group:dev debe poder emitir ticket SSH sin llaves hacia tag:server");
+    assert!(verify_mesh_ssh_ticket(&ticket, Some("control-ssh-seed"), None));
+    assert!(!verify_mesh_ssh_ticket(&ticket, Some("wrong-seed"), None));
+    assert!(!verify_mesh_ssh_ticket(&ticket, Some("control-ssh-seed"), Some(ticket.expires_at_sec + 10)));
+
+    assert!(issue_mesh_ssh_ticket("control-ssh-seed", &engine, &guest, &prod_srv, 300).is_err());
 }
 
 #[test]

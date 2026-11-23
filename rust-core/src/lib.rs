@@ -8,6 +8,8 @@ pub mod tunnel;
 pub mod routing;
 pub mod magic_dns;
 pub mod acl;
+pub mod netcheck;
+pub mod ssh;
 pub mod nat;
 pub mod stun;
 pub mod turn;
@@ -254,13 +256,13 @@ pub extern "C" fn nexomesh_configure_session(
     peer_key: *const c_char,
     peer_endpoint: *const c_char,
 ) -> i32 {
-    let lv = cstr_to_string(local_vip, "10.0.0.2");
-    let pv = cstr_to_string(peer_vip, "10.0.0.1");
+    let lv = cstr_to_string(local_vip, "100.64.0.2");
+    let pv = cstr_to_string(peer_vip, "100.64.0.1");
     let lk = cstr_to_string(local_key, "ios-local-key");
     let pk = cstr_to_string(peer_key, "peer-key");
     let ep = cstr_to_string(peer_endpoint, "");
 
-    if session::ensure_session(&pv, &lk, &pk).is_err() {
+    if session::ensure_noise_session(&pv, &lk, &pk).is_err() {
         return -1;
     }
     let Ok(mut node) = derp::Node::bind(&lv, &pv, 0) else {
@@ -279,8 +281,8 @@ pub extern "C" fn nexomesh_configure_session(
 pub extern "C" fn nexomesh_connect(pubkey: *const c_char, endpoint: *const c_char) -> i32 {
     let pk = cstr_to_string(pubkey, "peer-key");
     let ep = cstr_to_string(endpoint, "");
-    let lv = CString::new("10.0.0.2").unwrap();
-    let pv = CString::new("10.0.0.1").unwrap();
+    let lv = CString::new("100.64.0.2").unwrap();
+    let pv = CString::new("100.64.0.1").unwrap();
     let lk = CString::new("ios-local-key").unwrap();
     let pk_c = CString::new(pk).unwrap();
     let ep_c = CString::new(ep).unwrap();
@@ -384,6 +386,23 @@ pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_initSession(
     let lk: String = env.get_string(&local_key).map(|s| s.into()).unwrap_or_default();
     let pk: String = env.get_string(&peer_key).map(|s| s.into()).unwrap_or_default();
     match session::ensure_session(&pid, &lk, &pk) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_nexomesh_vpn_RustCoreBridge_initStrictNoiseSession(
+    mut env: JNIEnv,
+    _class: JClass,
+    peer_id: JString,
+    local_key: JString,
+    peer_key: JString,
+) -> jboolean {
+    let pid: String = env.get_string(&peer_id).map(|s| s.into()).unwrap_or_default();
+    let lk: String = env.get_string(&local_key).map(|s| s.into()).unwrap_or_default();
+    let pk: String = env.get_string(&peer_key).map(|s| s.into()).unwrap_or_default();
+    match session::ensure_noise_session(&pid, &lk, &pk) {
         Ok(_) => 1,
         Err(_) => 0,
     }

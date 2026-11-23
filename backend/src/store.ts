@@ -60,6 +60,10 @@ export class Store {
     signingKey: string;
     nodeKey: string;
     userId: string;
+    provider?: string;
+    groups?: string[];
+    tags?: string[];
+    sshEnabled?: boolean;
     virtualIp: string;
     virtualIpv6?: string;
     approved: boolean;
@@ -70,12 +74,16 @@ export class Store {
   }): void {
     this.db.prepare(
       `INSERT OR REPLACE INTO netmap_nodes
-       (signing_key, node_key, user_id, virtual_ip, virtual_ipv6, approved, expires_at, home_derp, endpoints, subnets)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (signing_key, node_key, user_id, provider, groups_json, tags_json, ssh_enabled, virtual_ip, virtual_ipv6, approved, expires_at, home_derp, endpoints, subnets)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       node.signingKey,
       node.nodeKey,
       node.userId,
+      node.provider ?? "oidc",
+      JSON.stringify(node.groups ?? []),
+      JSON.stringify(node.tags ?? []),
+      node.sshEnabled === false ? 0 : 1,
       node.virtualIp,
       node.virtualIpv6 ?? "",
       node.approved ? 1 : 0,
@@ -90,6 +98,10 @@ export class Store {
     signingKey: string;
     nodeKey: string;
     userId: string;
+    provider: "google" | "github" | "oidc";
+    groups: string[];
+    tags: string[];
+    sshEnabled: boolean;
     virtualIp: string;
     virtualIpv6: string;
     approved: boolean;
@@ -103,6 +115,10 @@ export class Store {
       signingKey: r.signing_key,
       nodeKey: r.node_key,
       userId: r.user_id,
+      provider: (r.provider ?? "oidc") as "google" | "github" | "oidc",
+      groups: JSON.parse(r.groups_json ?? "[]"),
+      tags: JSON.parse(r.tags_json ?? "[]"),
+      sshEnabled: r.ssh_enabled !== 0,
       virtualIp: r.virtual_ip,
       virtualIpv6: String(r.virtual_ipv6 ?? ""),
       approved: Boolean(r.approved),
