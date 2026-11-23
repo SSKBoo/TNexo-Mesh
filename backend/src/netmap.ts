@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { verifySignature } from "./signaling.ts";
 import type { Store } from "./store.ts";
 
-export type OidcProvider = "google" | "github" | "oidc";
+export type OidcProvider = "google" | "github" | "okta" | "oidc";
 
 export interface NetMapAclRule {
   src: string;
@@ -27,6 +27,8 @@ export interface NetMapNode {
   homeDerp: number;
   endpoints: string[];
   subnets: string[];
+  tkaSigner?: string;
+  tkaSignature?: string;
 }
 
 export interface NetMapPayload {
@@ -34,6 +36,8 @@ export interface NetMapPayload {
   issuedAt: number;
   nodes: NetMapNode[];
   acls: NetMapAclRule[];
+  tailnetLockEnabled: boolean;
+  previousControlPubKeys: string[];
 }
 
 export interface SignedNetMap {
@@ -71,7 +75,7 @@ function intToIpv4(n: number): string {
   return `${(n >>> 24) & 255}.${(n >>> 16) & 255}.${(n >>> 8) & 255}.${n & 255}`;
 }
 
-/** Valida un claim OIDC / SSO (Google, GitHub o OIDC genérico) asociado al `userId`. */
+/** Valida un claim OIDC / SSO (Google, GitHub, Okta o OIDC genérico) asociado al `userId`. */
 export function verifyOidcClaim(
   oidcToken: string,
   expectedUserId: string,
@@ -91,6 +95,9 @@ export function verifyOidcClaim(
     if (expectedProvider === "github" && claims.iss && !String(claims.iss).includes("github")) {
       return false;
     }
+    if (expectedProvider === "okta" && claims.iss && !String(claims.iss).includes("okta")) {
+      return false;
+    }
     return true;
   } catch {
     return false;
@@ -105,6 +112,11 @@ export function verifyIdentityBinding(
 ): boolean {
   if (!nodeKey || !signingKey || !bindingSignature) return false;
   return verifySignature(signingKey, `bind:${nodeKey}`, bindingSignature);
+}
+
+/** Mensaje canónico de co-firma multi-nodo Tailnet Lock (TKA). */
+export function tailnetLockMessage(nodeKey: string, signingKey: string, virtualIp: string): string {
+  return `tka-cosign-v1:${nodeKey}:${signingKey}:${virtualIp}`;
 }
 
 function nodeMatchesSelector(node: NetMapNode, selector: string): boolean {
@@ -122,10 +134,13 @@ function nodeMatchesSelector(node: NetMapNode, selector: string): boolean {
 }
 
 export class NetMapAuthority {
-  private readonly pubB64: string;
-  private readonly privKey: crypto.KeyObject;
+  private pubB64: string;
+  private privKey: crypto.KeyObject;
+  private previousPubKeys: string[] = [];
   private nodes = new Map<string, NetMapNode>();
   private acls: NetMapAclRule[] = [];
+  private tailnetLockEnabled = false;
+  private tailnetLockKeys = new Set<string>();
   private version = 1;
   private store?: Store;
 
@@ -148,6 +163,66 @@ export class NetMapAuthority {
 
   get controlPublicKey(): string {
     return this.pubB64;
+  }
+
+  get isTailnetLockEnabled(): boolean {
+    return this.tailnetLockEnabled;
+  }
+
+  /** Rota la llave raíz del plano de control manteniendo llaves previas en ventana de transición sin tirar la malla. */
+  rotateControlKey(actor: string = "control-admin"): { newControlPubKey: string; previousKeys: string[] } {
+    this.previousPubKeys = [this.pubB64, ...this.previousPubKeys].slice(0, 3);
+    const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+    this.pubB64 = publicKey.export({ format: "der", type: "spki" }).subarray(-32).toString("base64");
+    this.privKey = privateKey;
+    this.version += 1;
+    this.store?.appendAuditLog(actor, "rotate_control_key", this.pubB64, {
+      previousCount: this.previousPubKeys.length,
+    });
+    return { newControlPubKey: this.pubB64, previousKeys: [...this.previousPubKeys] };
+  }
+
+  /** Activa Tailnet Lock con una o más llaves públicas TKA confiables de nodos fundadores. */
+  enableTailnetLock(trustedLockPubKeys: string[], actor: string = "control-admin"): void {
+    this.tailnetLockEnabled = true;
+    for (const k of trustedLockPubKeys) {
+      if (k) this.tailnetLockKeys.add(k);
+    }
+    this.version += 1;
+    this.store?.appendAuditLog(actor, "enable_tailnet_lock", "tailnet", {
+      trustedKeys: Array.from(this.tailnetLockKeys),
+    });
+  }
+
+  /** Agrega una firma multi-nodo TKA a un dispositivo para aprobarlo bajo Tailnet Lock. */
+  cosignNode(signingKey: string, tkaSignerPubKey: string, tkaSignature: string): NetMapNode | null {
+    if (this.tailnetLockEnabled && !this.tailnetLockKeys.has(tkaSignerPubKey)) {
+      throw new Error("untrusted tailnet lock authority key");
+    }
+    const rec = this.nodes.get(signingKey);
+    if (!rec) return null;
+    const msg = tailnetLockMessage(rec.nodeKey, rec.signingKey, rec.virtualIp);
+    if (!verifySignature(tkaSignerPubKey, msg, tkaSignature)) {
+      throw new Error("invalid tailnet lock node cosignature");
+    }
+    rec.tkaSigner = tkaSignerPubKey;
+    rec.tkaSignature = tkaSignature;
+    this.version += 1;
+    this.store?.appendAuditLog(tkaSignerPubKey, "tailnet_lock_cosign", signingKey, {
+      virtualIp: rec.virtualIp,
+    });
+    return rec;
+  }
+
+  isTailnetLockVerified(node: NetMapNode): boolean {
+    if (!this.tailnetLockEnabled) return true;
+    if (!node.tkaSigner || !node.tkaSignature) return false;
+    if (!this.tailnetLockKeys.has(node.tkaSigner)) return false;
+    return verifySignature(
+      node.tkaSigner,
+      tailnetLockMessage(node.nodeKey, node.signingKey, node.virtualIp),
+      node.tkaSignature
+    );
   }
 
   /** Asigna una IP CGNAT libre sin colisiones dentro de `100.64.0.0/10` (4.19M direcciones). */
@@ -220,6 +295,10 @@ export class NetMapAuthority {
     this.nodes.set(record.signingKey, record);
     this.store?.saveNetMapNode(record);
     this.store?.linkSigningKey(record.nodeKey, record.signingKey);
+    this.store?.appendAuditLog(record.userId, "register_node", record.signingKey, {
+      virtualIp: record.virtualIp,
+      provider: record.provider,
+    });
     this.version += 1;
     return record;
   }
@@ -229,6 +308,7 @@ export class NetMapAuthority {
     if (!rec) return null;
     rec.approved = approved;
     this.store?.saveNetMapNode(rec);
+    this.store?.appendAuditLog("control-admin", approved ? "approve_device" : "unapprove_device", signingKey);
     this.version += 1;
     return rec;
   }
@@ -240,6 +320,7 @@ export class NetMapAuthority {
     rec.approved = false;
     rec.expiresAt = 0;
     this.store?.saveNetMapNode(rec);
+    this.store?.appendAuditLog("control-admin", "revoke_node", signingKey);
     this.version += 1;
     return rec;
   }
@@ -256,7 +337,7 @@ export class NetMapAuthority {
   isActiveAndApproved(signingKey: string, now: number = Date.now()): boolean {
     const rec = this.nodes.get(signingKey);
     if (!rec) return false;
-    return rec.approved && rec.expiresAt > now;
+    return rec.approved && rec.expiresAt > now && this.isTailnetLockVerified(rec);
   }
 
   getNode(signingKey: string): NetMapNode | null {
@@ -270,6 +351,7 @@ export class NetMapAuthority {
   setAcls(acls: NetMapAclRule[]): void {
     this.acls = [...acls];
     this.store?.saveNetMapAcls(this.acls);
+    this.store?.appendAuditLog("control-admin", "update_acls", "netmap", { count: acls.length });
     this.version += 1;
   }
 
@@ -288,11 +370,13 @@ export class NetMapAuthority {
       (r) => Boolean(r.ssh) && nodeMatchesSelector(src, r.src) && nodeMatchesSelector(dst, r.dst)
     );
     if (!matched) {
+      this.store?.appendAuditLog(src.userId, "ssh_denied", dst.signingKey);
       return { allowed: false, reason: "denied by NetMap SSH ACL policy" };
     }
     const expiresAt = now + ttlMs;
     const canonical = `ssh|${src.userId}|${src.nodeKey}|${dst.nodeKey}|${expiresAt}`;
     const signature = crypto.sign(null, Buffer.from(canonical), this.privKey).toString("base64");
+    this.store?.appendAuditLog(src.userId, "ssh_authorized", dst.signingKey, { expiresAt });
     return {
       allowed: true,
       sshCert: {
@@ -310,13 +394,15 @@ export class NetMapAuthority {
 
   issueSignedNetMap(now: number = Date.now()): SignedNetMap {
     const activeNodes = Array.from(this.nodes.values()).filter(
-      (n) => n.approved && n.expiresAt > now
+      (n) => n.approved && n.expiresAt > now && this.isTailnetLockVerified(n)
     );
     const payload: NetMapPayload = {
       version: this.version,
       issuedAt: now,
       nodes: activeNodes,
       acls: this.acls,
+      tailnetLockEnabled: this.tailnetLockEnabled,
+      previousControlPubKeys: [...this.previousPubKeys],
     };
     const canonical = JSON.stringify(payload);
     const sig = crypto.sign(null, Buffer.from(canonical), this.privKey).toString("base64");
@@ -328,7 +414,16 @@ export class NetMapAuthority {
   }
 }
 
-export function verifySignedNetMap(signed: SignedNetMap): boolean {
+export function verifySignedNetMap(signed: SignedNetMap, trustedControlKeys?: string[]): boolean {
   const canonical = JSON.stringify(signed.payload);
-  return verifySignature(signed.controlPubKey, canonical, signed.signature);
+  if (!verifySignature(signed.controlPubKey, canonical, signed.signature)) {
+    return false;
+  }
+  if (trustedControlKeys && trustedControlKeys.length > 0) {
+    const accepted =
+      trustedControlKeys.includes(signed.controlPubKey) ||
+      signed.payload.previousControlPubKeys.some((pk) => trustedControlKeys.includes(pk));
+    return accepted;
+  }
+  return true;
 }

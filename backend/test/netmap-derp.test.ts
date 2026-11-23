@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { createServer } from "node:http";
 import WebSocket from "ws";
-import { NetMapAuthority, verifyIdentityBinding, verifySignedNetMap } from "../src/netmap.ts";
+import { NetMapAuthority, tailnetLockMessage, verifyIdentityBinding, verifySignedNetMap } from "../src/netmap.ts";
 import { attachSignalingToHttpServer, DerpMeshRouter, SignalingHub } from "../src/signaling.ts";
 import { createApp } from "../src/index.ts";
 import { Store } from "../src/store.ts";
@@ -343,4 +343,55 @@ test("Federación HTTP/WS entre dos servidores DERP independientes (Región NA <
     new Promise<void>((r) => srvNa.close(() => r())),
     new Promise<void>((r) => srvEu.close(() => r())),
   ]);
+});
+
+test("Tailnet Lock multi-nodo, rotación de llave raíz sin cortes, Audit Logs y Flow Logs", () => {
+  const store = new Store(":memory:");
+  try {
+    const auth = new NetMapAuthority(store);
+    const initialRoot = auth.controlPublicKey;
+    const tka = genEd();
+    const dev = genEd();
+
+    auth.registerNode(
+      { nodeKey: "NK_LOCK_1", signingKey: dev.pubB64, userId: "ops@corp", provider: "okta", groups: ["group:dev"], tags: [], virtualIp: "auto", approved: true, endpoints: [], subnets: [] },
+      dev.sign("bind:NK_LOCK_1")
+    );
+    const devNode = auth.getNode(dev.pubB64)!;
+
+    // Al activar Tailnet Lock, el nodo sin co-firma TKA queda excluido del NetMap firmado
+    auth.enableTailnetLock([tka.pubB64]);
+    assert.equal(auth.issueSignedNetMap().payload.nodes.length, 0);
+
+    // Co-firmar con llave confiable TKA -> reingresa al NetMap
+    const tkaSig = tka.sign(tailnetLockMessage(devNode.nodeKey, devNode.signingKey, devNode.virtualIp));
+    auth.cosignNode(dev.pubB64, tka.pubB64, tkaSig);
+    assert.equal(auth.issueSignedNetMap().payload.nodes.length, 1);
+
+    // Rotar llave raíz del plano de control sin tirar la malla (ventana previousControlPubKeys)
+    const { newControlPubKey } = auth.rotateControlKey("sec-bot");
+    assert.notEqual(newControlPubKey, initialRoot);
+    const rotatedMap = auth.issueSignedNetMap();
+    assert.equal(verifySignedNetMap(rotatedMap, [initialRoot]), true);
+
+    // Audit Logs + Network Flow Logs
+    const audits = store.getAuditLogs(20);
+    assert.ok(audits.some((a) => a.action === "rotate_control_key"));
+    assert.ok(audits.some((a) => a.action === "tailnet_lock_cosign"));
+
+    store.appendFlowLog({
+      srcVip: devNode.virtualIp,
+      dstVip: "100.64.0.2",
+      proto: 6,
+      dstPort: 443,
+      bytes: 1480,
+      packets: 2,
+      action: "allow",
+    });
+    const flows = store.getFlowLogs(10);
+    assert.equal(flows.length, 1);
+    assert.equal(flows[0].dstPort, 443);
+  } finally {
+    store.close();
+  }
 });

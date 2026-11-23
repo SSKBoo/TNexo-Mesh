@@ -64,7 +64,7 @@ export function createApp(
         bindingSignature, approved, ttlMs, homeDerp, oidcToken,
       } = req.body ?? {};
       const resolvedUser = String(userId ?? "user");
-      const resolvedProvider = (provider ?? "oidc") as "google" | "github" | "oidc";
+      const resolvedProvider = (provider ?? "oidc") as "google" | "github" | "okta" | "oidc";
       if (
         typeof oidcToken === "string" &&
         oidcToken.length > 0 &&
@@ -102,6 +102,53 @@ export function createApp(
     const dstSigningKey = String(req.body?.dstSigningKey ?? "");
     const result = authority.authorizeSsh(srcSigningKey, dstSigningKey);
     res.status(result.allowed ? 200 : 403).json(result);
+  });
+  app.post("/netmap/rotate-root", (req, res) => {
+    const actor = String(req.body?.actor ?? "control-admin");
+    const rotated = authority.rotateControlKey(actor);
+    hub?.broadcastNetMap();
+    res.json({ ok: true, ...rotated, netmap: authority.issueSignedNetMap() });
+  });
+  app.post("/netmap/tailnet-lock/enable", (req, res) => {
+    const keys = Array.isArray(req.body?.trustedKeys) ? req.body.trustedKeys.map(String) : [];
+    authority.enableTailnetLock(keys);
+    hub?.broadcastNetMap();
+    res.json({ ok: true, tailnetLockEnabled: authority.isTailnetLockEnabled });
+  });
+  app.post("/netmap/tailnet-lock/cosign", (req, res) => {
+    try {
+      const { signingKey, tkaSigner, tkaSignature } = req.body ?? {};
+      const updated = authority.cosignNode(String(signingKey ?? ""), String(tkaSigner ?? ""), String(tkaSignature ?? ""));
+      if (!updated) {
+        res.status(404).json({ error: "device not found" });
+        return;
+      }
+      hub?.broadcastNetMap();
+      res.json({ ok: true, node: updated });
+    } catch (e: any) {
+      res.status(403).json({ error: e?.message ?? "tailnet lock cosign rejected" });
+    }
+  });
+  app.get("/audit-logs", (req, res) => {
+    const limit = Number(req.query?.limit ?? 100);
+    res.json({ logs: getStore().getAuditLogs(limit) });
+  });
+  app.post("/flow-logs", (req, res) => {
+    const b = req.body ?? {};
+    getStore().appendFlowLog({
+      srcVip: String(b.srcVip ?? ""),
+      dstVip: String(b.dstVip ?? ""),
+      proto: Number(b.proto ?? 6),
+      dstPort: Number(b.dstPort ?? 0),
+      bytes: Number(b.bytes ?? 0),
+      packets: Number(b.packets ?? 1),
+      action: b.action === "deny" ? "deny" : "allow",
+    });
+    res.status(201).json({ ok: true });
+  });
+  app.get("/flow-logs", (req, res) => {
+    const limit = Number(req.query?.limit ?? 200);
+    res.json({ flows: getStore().getFlowLogs(limit) });
   });
   app.post("/netmap/approve", (req, res) => {
     const { signingKey, approved } = req.body ?? {};

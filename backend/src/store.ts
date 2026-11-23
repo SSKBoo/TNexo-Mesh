@@ -142,6 +142,75 @@ export class Store {
     return row ? JSON.parse(row.rules) : [];
   }
 
+  // --- logs de auditoría y network flow logs ---
+  appendAuditLog(actor: string, action: string, target: string, details: unknown = {}): void {
+    this.db.prepare(
+      "INSERT INTO audit_logs (ts, actor, action, target, details) VALUES (?, ?, ?, ?, ?)"
+    ).run(Date.now(), actor, action, target, JSON.stringify(details));
+  }
+
+  getAuditLogs(limit: number = 100): Array<{
+    id: number;
+    ts: number;
+    actor: string;
+    action: string;
+    target: string;
+    details: unknown;
+  }> {
+    const rows = this.db
+      .prepare("SELECT id, ts, actor, action, target, details FROM audit_logs ORDER BY id DESC LIMIT ?")
+      .all(limit) as any[];
+    return rows.map((r) => ({
+      id: Number(r.id),
+      ts: Number(r.ts),
+      actor: String(r.actor),
+      action: String(r.action),
+      target: String(r.target),
+      details: JSON.parse(r.details),
+    }));
+  }
+
+  appendFlowLog(flow: {
+    srcVip: string;
+    dstVip: string;
+    proto: number;
+    dstPort: number;
+    bytes: number;
+    packets: number;
+    action: "allow" | "deny";
+  }): void {
+    this.db.prepare(
+      "INSERT INTO flow_logs (ts, src_vip, dst_vip, proto, dst_port, bytes, packets, action) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(Date.now(), flow.srcVip, flow.dstVip, flow.proto, flow.dstPort, flow.bytes, flow.packets, flow.action);
+  }
+
+  getFlowLogs(limit: number = 200): Array<{
+    id: number;
+    ts: number;
+    srcVip: string;
+    dstVip: string;
+    proto: number;
+    dstPort: number;
+    bytes: number;
+    packets: number;
+    action: string;
+  }> {
+    const rows = this.db
+      .prepare("SELECT id, ts, src_vip, dst_vip, proto, dst_port, bytes, packets, action FROM flow_logs ORDER BY id DESC LIMIT ?")
+      .all(limit) as any[];
+    return rows.map((r) => ({
+      id: Number(r.id),
+      ts: Number(r.ts),
+      srcVip: String(r.src_vip),
+      dstVip: String(r.dst_vip),
+      proto: Number(r.proto),
+      dstPort: Number(r.dst_port),
+      bytes: Number(r.bytes),
+      packets: Number(r.packets),
+      action: String(r.action),
+    }));
+  }
+
   // --- push subscriptions ---
   saveSubscription(endpoint: string, keys: unknown): void {
     this.db.prepare(

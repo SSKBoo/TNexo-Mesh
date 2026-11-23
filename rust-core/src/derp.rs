@@ -3,6 +3,7 @@
 use crate::nat;
 use crate::routing::is_mesh_ipv4;
 use crate::session;
+use crate::udp_batch::{self, BatchCapabilities};
 use crate::ws_client::{base64_decode, base64_encode};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -124,12 +125,14 @@ pub struct Node {
     rekey_in_flight: bool,
     last_rekey_attempt: Option<Instant>,
     disco_rtt_ms: Arc<Mutex<Option<u32>>>,
+    batch_caps: BatchCapabilities,
 }
 
 impl Node {
     pub fn bind(local_vip: &str, peer_vip: &str, port: u16) -> Result<Self> {
         let sock = UdpSocket::bind(("0.0.0.0", port))?;
         sock.set_read_timeout(Some(Duration::from_millis(50)))?;
+        let batch_caps = udp_batch::try_enable_gso_gro(&sock, 1280);
         Ok(Self {
             local_vip: local_vip.to_string(),
             peer_vip: peer_vip.to_string(),
@@ -147,7 +150,12 @@ impl Node {
             rekey_in_flight: false,
             last_rekey_attempt: None,
             disco_rtt_ms: Arc::new(Mutex::new(None)),
+            batch_caps,
         })
+    }
+
+    pub fn batch_capabilities(&self) -> BatchCapabilities {
+        self.batch_caps
     }
 
     pub fn local_port(&self) -> Result<u16> {
@@ -715,6 +723,57 @@ impl Node {
 
     pub fn using_direct(&self) -> bool {
         *self.direct_ok.lock().unwrap()
+    }
+
+    /// Envía un lote de paquetes IP cifrados en una ráfaga (`UDP batching` / fallback NM2).
+    pub fn send_packets_batch(&self, packets: &[Vec<u8>]) -> usize {
+        if packets.is_empty() {
+            return 0;
+        }
+        let mut frames = Vec::with_capacity(packets.len());
+        for p in packets {
+            if let Ok(f) = self.build_nm1_frame(p) {
+                frames.push(f);
+            }
+        }
+        if frames.is_empty() {
+            return 0;
+        }
+        if *self.direct_ok.lock().unwrap() {
+            if let Some(addr) = self.peer_addr {
+                return udp_batch::send_batch_to(&self.sock, &frames, addr);
+            }
+        }
+        let mut sent = 0usize;
+        if self.relay_tx.is_some() {
+            for f in &frames {
+                if self.send_via_relay(f).is_ok() {
+                    sent += 1;
+                }
+            }
+        }
+        sent
+    }
+
+    /// Lee hasta `max_packets` datagramas UDP en lote reduciendo syscalls de `recv_from`.
+    pub fn poll_udp_batch(&mut self, max_packets: usize) -> Vec<NodeEvent> {
+        let raw_batch = udp_batch::recv_batch_from(&self.sock, max_packets);
+        let mut events = Vec::new();
+        for (pkt, from) in raw_batch {
+            if pkt.starts_with(b"NM_") {
+                if let Ok(Some(ev)) = self.handle_control_packet(&pkt, Some(from)) {
+                    events.push(ev);
+                }
+            } else if pkt.len() >= 6 && &pkt[0..3] == b"NM1" {
+                if let Ok((sender_vip, packet)) = Self::parse_nm1_frame(&pkt) {
+                    self.peer_addr = Some(from);
+                    *self.direct_ok.lock().unwrap() = true;
+                    *self.last_direct_rx.lock().unwrap() = Some(Instant::now());
+                    events.push(NodeEvent::Packet { sender_vip, packet });
+                }
+            }
+        }
+        events
     }
 }
 

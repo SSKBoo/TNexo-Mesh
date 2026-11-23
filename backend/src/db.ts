@@ -37,6 +37,25 @@ export function openDb(path: string = ":memory:"): Database.Database {
       id INTEGER PRIMARY KEY CHECK (id = 1),
       rules TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      actor TEXT NOT NULL,
+      action TEXT NOT NULL,
+      target TEXT NOT NULL,
+      details TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS flow_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      src_vip TEXT NOT NULL,
+      dst_vip TEXT NOT NULL,
+      proto INTEGER NOT NULL,
+      dst_port INTEGER NOT NULL,
+      bytes INTEGER NOT NULL,
+      packets INTEGER NOT NULL,
+      action TEXT NOT NULL
+    );
   `);
   for (const col of [
     "ALTER TABLE netmap_nodes ADD COLUMN virtual_ipv6 TEXT NOT NULL DEFAULT ''",

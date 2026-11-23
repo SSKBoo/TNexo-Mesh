@@ -8,9 +8,12 @@ use nexomesh_core::nat::{
 };
 use nexomesh_core::netcheck::run_full_netcheck;
 use nexomesh_core::routing::RoutingTable;
+use nexomesh_core::serve_funnel::{start_serve_funnel_proxy, ExposureMode, ServeRegistry};
+use nexomesh_core::session;
 use nexomesh_core::ssh::{issue_mesh_ssh_ticket, verify_mesh_ssh_ticket};
+use nexomesh_core::udp_batch::{coalesce_gso_segments, split_gro_datagram};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -227,6 +230,92 @@ fn identity_acl_groups_tags_and_keyless_mesh_ssh_ticket() {
     assert!(!verify_mesh_ssh_ticket(&ticket, Some("control-ssh-seed"), Some(ticket.expires_at_sec + 10)));
 
     assert!(issue_mesh_ssh_ticket("control-ssh-seed", &engine, &guest, &prod_srv, 300).is_err());
+}
+
+#[test]
+fn udp_gso_gro_coalescing_and_batch_node_roundtrip() {
+    let segs: [&[u8]; 3] = [b"FRAME_ALPHA", b"FRAME_BETA_2", b"FRAME_GAMMA_3"];
+    let coalesced = coalesce_gso_segments(&segs, 1280);
+    assert_eq!(coalesced.len(), 1);
+    let unpacked = split_gro_datagram(&coalesced[0]);
+    assert_eq!(unpacked.len(), 3);
+    assert_eq!(unpacked[0], b"FRAME_ALPHA");
+    assert_eq!(unpacked[2], b"FRAME_GAMMA_3");
+
+    session::ensure_session("100.64.5.2", "BATCH_A", "BATCH_B").unwrap();
+    session::ensure_session("100.64.5.1", "BATCH_B", "BATCH_A").unwrap();
+    let mut node_a = nexomesh_core::derp::Node::bind("100.64.5.1", "100.64.5.2", 0).unwrap();
+    let mut node_b = nexomesh_core::derp::Node::bind("100.64.5.2", "100.64.5.1", 0).unwrap();
+    let addr_a: SocketAddr = format!("127.0.0.1:{}", node_a.local_port().unwrap()).parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{}", node_b.local_port().unwrap()).parse().unwrap();
+    node_a.set_peer(addr_b);
+    node_b.set_peer(addr_a);
+    let _ = node_a.send_hello("batch-a");
+    let _ = node_b.poll_udp_once();
+    let _ = node_a.poll_udp_once();
+
+    let pkts: Vec<Vec<u8>> = (1..=5u16)
+        .map(|seq| nexomesh_core::derp::build_icmp_echo_request("100.64.5.1", "100.64.5.2", seq).unwrap())
+        .collect();
+    assert_eq!(node_a.send_packets_batch(&pkts), 5);
+    std::thread::sleep(Duration::from_millis(20));
+    let events = node_b.poll_udp_batch(16);
+    let pkt_count = events
+        .iter()
+        .filter(|e| matches!(e, nexomesh_core::derp::NodeEvent::Packet { .. }))
+        .count();
+    assert_eq!(pkt_count, 5);
+}
+
+#[test]
+fn l7_serve_enforces_mesh_only_and_funnel_forwards_public_http() {
+    let mut reg = ServeRegistry::new();
+    reg.register("app.nexomesh", "127.0.0.1:3000", ExposureMode::ServeMeshOnly);
+    assert_eq!(reg.get("app.nexomesh.").unwrap().mode, ExposureMode::ServeMeshOnly);
+
+    // Upstream HTTP mock
+    let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+    let up_addr = upstream.local_addr().unwrap();
+    std::thread::spawn(move || {
+        while let Ok((mut s, _)) = upstream.accept() {
+            let mut buf = [0u8; 2048];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let txt = String::from_utf8_lossy(&buf[..n]);
+            let body = if txt.contains("X-NexoMesh-Serve: 1") {
+                "OK_SERVE"
+            } else if txt.contains("X-NexoMesh-Funnel: 1") {
+                "OK_FUNNEL"
+            } else {
+                "RAW"
+            };
+            let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = s.write_all(resp.as_bytes());
+        }
+    });
+
+    // 1. Serve (solo malla): rechaza IP pública en X-Forwarded-For con 403 y permite 100.64.0.2
+    let (serve_addr, run_serve) = start_serve_funnel_proxy("127.0.0.1:0", &up_addr.to_string(), true).unwrap();
+    let mut ext_cli = TcpStream::connect(serve_addr).unwrap();
+    ext_cli.write_all(b"GET / HTTP/1.1\r\nHost: app.nexomesh\r\nX-Forwarded-For: 8.8.8.8\r\n\r\n").unwrap();
+    let mut r1 = String::new();
+    let _ = ext_cli.read_to_string(&mut r1);
+    assert!(r1.starts_with("HTTP/1.1 403"), "Serve debe bloquear clientes fuera de la malla: {r1}");
+
+    let mut mesh_cli = TcpStream::connect(serve_addr).unwrap();
+    mesh_cli.write_all(b"GET / HTTP/1.1\r\nHost: app.nexomesh\r\nX-Forwarded-For: 100.64.0.2\r\n\r\n").unwrap();
+    let mut r2 = String::new();
+    let _ = mesh_cli.read_to_string(&mut r2);
+    assert!(r2.ends_with("OK_SERVE"), "Serve debe reenviar pares 100.64/10: {r2}");
+    run_serve.store(false, Ordering::Relaxed);
+
+    // 2. Funnel (ingreso público a internet)
+    let (funnel_addr, run_funnel) = start_serve_funnel_proxy("127.0.0.1:0", &up_addr.to_string(), false).unwrap();
+    let mut pub_cli = TcpStream::connect(funnel_addr).unwrap();
+    pub_cli.write_all(b"GET / HTTP/1.1\r\nHost: pub.nexomesh.net\r\nX-Forwarded-For: 8.8.8.8\r\n\r\n").unwrap();
+    let mut r3 = String::new();
+    let _ = pub_cli.read_to_string(&mut r3);
+    assert!(r3.ends_with("OK_FUNNEL"), "Funnel debe permitir tráfico público: {r3}");
+    run_funnel.store(false, Ordering::Relaxed);
 }
 
 #[test]

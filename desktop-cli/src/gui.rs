@@ -675,8 +675,12 @@ fn run_tunnel_loop(state: Arc<Mutex<GuiState>>) {
             let mut g = state.lock().unwrap();
             std::mem::take(&mut g.outbound_packets)
         };
-        for pkt in pending {
-            let _ = node.send_packet(&pkt);
+        if pending.len() > 1 {
+            let _ = node.send_packets_batch(&pending);
+        } else {
+            for pkt in pending {
+                let _ = node.send_packet(&pkt);
+            }
         }
 
         if let (Some(rx), Some(client)) = (relay_rx.as_ref(), ws.as_mut()) {
